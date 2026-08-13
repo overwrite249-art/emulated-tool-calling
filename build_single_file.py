@@ -22,11 +22,8 @@ HE = "# --- end generated header ---"
 
 # Dependency order: every definition appears before anything that runs it.
 ORDER = [
-    "_prelude", "config", "util", "types", "protocol", "jsonx", "parsing",
-    "streaming", "loops", "upstream", "translate", "payload", "engine",
-    "respond_anthropic", "respond_openai", "server",
-    "selftest_support", "selftest_part3", "selftest_part2", "selftest_main",
-    "cli",
+    "_prelude", "core", "protocol", "wire", "engine", "server",
+    "selftest_a", "selftest_b", "cli",
 ]
 
 
