@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+*.log
+
+# Local probe / capture artifacts - these can contain live API keys.
+# Never commit them.
+probe.py
+r*.json
+*.b64
+*.xz
+*.zip
