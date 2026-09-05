@@ -205,6 +205,8 @@ def upstream_complete(cfg: Config, payload: Dict[str, Any]) -> Dict[str, Any]:
     resp = _request_with_retries(cfg, payload, stream=False)
     try:
         raw = resp.read()
+    except (OSError, http.client.HTTPException) as exc:
+        raise UpstreamError("upstream response interrupted: %s" % exc, 502) from exc
     finally:
         try:
             resp.close()
@@ -226,42 +228,63 @@ def upstream_complete(cfg: Config, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def iter_sse(resp) -> Iterator[Dict[str, Any]]:
-    """Yield parsed `data:` payloads from an SSE response."""
+    """Decode UTF-8 incrementally and dispatch complete SSE events, not lines.
+
+    HTTPResponse.read(n) waits for n bytes; read1(n) returns currently available
+    bytes, so a short first token is not held until a kilobyte or EOF arrives.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8-sig")("strict")
+    read = getattr(resp, "read1", None) or resp.read
     buf = ""
-    while True:
-        chunk = resp.read(1024)
-        if not chunk:
-            break
-        buf += chunk.decode("utf-8", "replace")
-        while "\n" in buf:
-            line, buf = buf.split("\n", 1)
-            line = line.rstrip("\r")
-            if not line or line.startswith(":"):
-                continue
-            if not line.startswith("data:"):
-                continue
-            data = line[5:].strip()
-            if data == "[DONE]":
-                return
-            try:
-                yield json.loads(data)
-            except ValueError:
-                log_debug("skipping unparseable SSE line: %s" % data[:200])
-    tail = buf.strip()
-    if tail.startswith("data:"):
-        data = tail[5:].strip()
-        if data and data != "[DONE]":
-            try:
-                yield json.loads(data)
-            except ValueError:
-                pass
+    fields: List[str] = []
+    eof = False
+    while not eof:
+        raw = read(4096)
+        eof = not raw
+        try:
+            buf += decoder.decode(raw, final=eof)
+        except UnicodeError as exc:
+            raise UpstreamError("upstream SSE is not valid UTF-8", 502) from exc
+        while True:
+            # Hold a trailing CR until the next read: it may be half of CRLF.
+            newline = re.search(r"\r\n|\r(?=.)|\n", buf, re.DOTALL)
+            if newline:
+                line, buf = buf[:newline.start()], buf[newline.end():]
+            elif eof and buf:
+                line, buf = buf.rstrip("\r"), ""
+            elif eof and fields:
+                line = ""  # accept a final event lacking its blank terminator
+            else:
+                break
+            if line == "":
+                if not fields:
+                    continue
+                data = "\n".join(fields)
+                fields = []
+                if data.strip() == "[DONE]":
+                    return
+                if not data.strip():
+                    continue
+                try:
+                    obj = json.loads(data)
+                except ValueError as exc:
+                    raise UpstreamError("upstream sent invalid JSON in an SSE event", 502) from exc
+                if not isinstance(obj, dict):
+                    raise UpstreamError("upstream SSE payload must be an object", 502)
+                yield obj
+            elif not line.startswith(":"):
+                name, _, value = line.partition(":")
+                if name == "data":
+                    fields.append(value[1:] if value.startswith(" ") else value)
 
 
 def upstream_stream(cfg: Config, payload: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
     """Yield {'text':..} / {'reasoning':..} / {'usage':..} / {'finish':..} events."""
     payload = dict(payload)
     payload["stream"] = True
+    payload["stream_options"] = {"include_usage": True}
     resp = _request_with_retries(cfg, payload, stream=True)
+    saw_finish = False
     try:
         for obj in iter_sse(resp):
             if not isinstance(obj, dict):
@@ -296,7 +319,12 @@ def upstream_stream(cfg: Config, payload: Dict[str, Any]) -> Iterator[Dict[str, 
                 yield {"text": msgobj["content"]}
             fr = ch.get("finish_reason")
             if fr:
+                saw_finish = True
                 yield {"finish": fr}
+        if not saw_finish:
+            raise UpstreamError("upstream stream ended before finish_reason", 502)
+    except (OSError, http.client.HTTPException) as exc:
+        raise UpstreamError("upstream stream interrupted: %s" % exc, 502) from exc
     finally:
         try:
             resp.close()
@@ -309,7 +337,7 @@ def extract_completion_text(data: Dict[str, Any]) -> Tuple[str, str, Dict[str, A
     usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices:
-        return "", "stop", usage
+        raise UpstreamError("upstream response has no choices", 502)
     ch = choices[0] if isinstance(choices[0], dict) else {}
     msg = ch.get("message") if isinstance(ch.get("message"), dict) else {}
     content = msg.get("content")
@@ -368,7 +396,9 @@ def _blocks_to_text(content: Any) -> str:
             out.append("[document omitted: this model is text-only]")
         elif btype == "thinking" or btype == "redacted_thinking":
             continue
-        elif btype == "input_audio":
+        elif btype == "tool_result":
+            out.append(_blocks_to_text(block.get("content")))
+        elif btype == "input_audio" or btype == "audio":
             out.append("[audio omitted: this model is text-only]")
         elif "text" in block:
             out.append(safe_str(block.get("text")))
@@ -474,6 +504,8 @@ def anthropic_to_canon(body: Dict[str, Any], cfg: Config) -> CanonRequest:
         top_p=body.get("top_p"),
         stop=[s for s in stops if isinstance(s, str)],
         stream=bool(body.get("stream")),
+        parallel_tool_calls=(not tc["disable_parallel_tool_use"]
+                             if isinstance(tc, dict) and "disable_parallel_tool_use" in tc else None),
         protocol="anthropic",
     )
 
@@ -587,6 +619,7 @@ def openai_to_canon(body: Dict[str, Any], cfg: Config) -> CanonRequest:
         top_p=body.get("top_p"),
         stop=[s for s in stops if isinstance(s, str)],
         stream=bool(body.get("stream")),
+        parallel_tool_calls=body.get("parallel_tool_calls"),
         protocol="openai",
     )
 
@@ -603,7 +636,7 @@ def build_upstream_messages(req: CanonRequest, cfg: Config, extra_system: List[s
 
     tools_active = bool(req.tools) and req.tool_choice != "none"
     if tools_active:
-        system_chunks.append(build_tool_prompt(req.tools, cfg.parallel))
+        system_chunks.append(build_tool_prompt(req.tools, cfg.parallel and req.parallel_tool_calls is not False))
         if req.tool_choice == "required":
             system_chunks.append(
                 "For this turn you MUST call a tool. Emit exactly one <tool_call> block and "
@@ -668,6 +701,8 @@ def build_upstream_payload(
 ) -> Dict[str, Any]:
     effective = req
     if not allow_tools:
+        if req.tools and req.tool_choice == "none":
+            extra_system = list(extra_system) + ["Tools are disabled for this turn. Answer directly without tool calls."]
         effective = CanonRequest(
             model=req.model,
             messages=req.messages,
