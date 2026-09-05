@@ -52,4 +52,30 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(upstream.call_count,1);self.assertEqual(''.join(v for k,v in events if k=='text'),'Actual answer.')
 
 
+    def test_unknown_tool_recovers(self):
+        self.recover(render_tool_call_text(ToolCall('Unknown',{'file_path':'a'})))
+    def test_invalid_schema_recovers(self):
+        self.recover(render_tool_call_text(ToolCall('Read',{})))
+    def test_rejected_call_after_prose_recovers(self):
+        self.recover('Starting now.'+render_tool_call_text(ToolCall('Unknown',{})))
+    def test_valid_call_before_rejected_call_is_not_replayed(self):
+        raw=tool()+render_tool_call_text(ToolCall('Unknown',{}))
+        with patch.object(engine,'upstream_stream',side_effect=lambda *_:chunks(raw)) as upstream:
+            events=list(engine.run_turn_stream(self.request(),Config()))
+        self.assertEqual(upstream.call_count,1)
+        self.assertEqual(len([v for k,v in events if k=='call']),1)
+    def test_rejected_calls_fail_after_bounded_repairs(self):
+        raw=render_tool_call_text(ToolCall('Unknown',{}))
+        with patch.object(engine,'upstream_stream',side_effect=lambda *_:chunks(raw)) as upstream:
+            with self.assertRaises(engine.UpstreamError):list(engine.run_turn_stream(self.request(),Config()))
+        self.assertEqual(upstream.call_count,3)
+    def test_transport_failure_after_call_is_not_replayed(self):
+        def broken(*args):
+            for c in tool():yield {'text':c}
+            raise engine.UpstreamError('connection lost',502)
+        with patch.object(engine,'upstream_stream',side_effect=broken) as upstream:
+            with self.assertRaises(engine.UpstreamError):list(engine.run_turn_stream(self.request(),Config()))
+        self.assertEqual(upstream.call_count,1)
+
+
 if __name__=='__main__':unittest.main()

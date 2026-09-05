@@ -40,6 +40,14 @@ def _prepare(req: CanonRequest, cfg: Config) -> Tuple[LoopState, List[str], bool
     st = analyze_history(req.messages, cfg)
     extra = list(st.nudges)
     allow_tools = bool(req.tools) and req.tool_choice != "none" and not st.budget_exhausted
+    if allow_tools:
+        extra.append(
+            "Final tool-format requirement: use flat <tool_call> blocks containing JSON with "
+            "name and arguments. Put the exact declared tool name in the JSON name string. "
+            "Do not use previous_call, name=, DSML, arg, or parameter tags. Encode source code "
+            "as JSON strings. Emit at most %d independent blocks, then stop after the last block."
+            % _call_limit(req, cfg)
+        )
     if st.budget_exhausted:
         extra.append(BUDGET_MESSAGE)
         log_warn(
@@ -121,17 +129,20 @@ def run_turn(req: CanonRequest, cfg: Config) -> TurnResult:
 
 
 def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]:
-    """Retry unusable output only before substantive text or a call was delivered.
+    """Repair empty/rejected output without replaying a delivered tool call.
 
-    A fresh parser is used for each attempt. Usage includes failed attempts, and
-    already-delivered calls are never replayed. Transport failures still surface
-    as errors rather than silently restarting a partially delivered stream.
+    Prose already delivered is retained. A retry is allowed only if no tool was
+    delivered, so no action is duplicated. Transport failures are never retried
+    here. Usage includes all completed attempts, including rejected output.
     """
     total_usage: Dict[str, Any] = {}
     hint = ""
     max_attempts = 3 if cfg.loop_retry else 1
     for attempt in range(1, max_attempts + 1):
         empty = False
+        required_missing = False
+        call_count = 0
+        rejected: List[str] = []
         finish = "stop"
         for kind, value in _run_turn_stream_attempt(req, cfg, hint):
             if kind == "usage":
@@ -140,21 +151,36 @@ def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]
                         total_usage[key] = total_usage.get(key, 0) + number
             elif kind == "empty":
                 empty = True
+            elif kind == "rejected":
+                rejected.append(value)
+            elif kind == "required_missing":
+                required_missing = True
             elif kind == "finish":
                 finish = value
             else:
+                if kind == "call":
+                    call_count += 1
                 yield (kind, value)
-        if not empty:
+        needs_repair = empty or ((rejected or required_missing) and not call_count)
+        if not needs_repair:
+            if rejected:
+                yield ("text", "\n\n[tool guard] Rejected tool call: " + " ".join(rejected))
             yield ("usage", total_usage)
             yield ("finish", finish)
             return
         if attempt == max_attempts:
+            if rejected and not cfg.loop_retry and not required_missing:
+                yield ("text", "\n\n[tool guard] Rejected tool call: " + " ".join(rejected))
+                yield ("usage", total_usage)
+                yield ("finish", "stop")
+                return
             raise UpstreamError("model returned no usable response after %d attempt(s)" % attempt, 502)
         log_warn("retrying unusable streamed output (attempt %d/%d)" % (attempt, max_attempts))
-        hint = ("Your previous response contained no usable text or valid tool call. "
-                "Continue the task using ONLY the declared tools and the documented <tool_call> JSON format. "
-                "Never fabricate tool results. Complete every JSON string; split large writes across turns. "
-                "If no tool is needed, give a substantive answer.")
+        hint = ("Your last attempted tool call was unusable; NO tool was executed. "
+                "Correct it using the exact declared tool name and valid JSON arguments. "
+                "Use only flat <tool_call>{\"name\":\"TOOL_NAME\",\"arguments\":{...}}</tool_call> blocks. "
+                "Never fabricate results or repeat preceding prose. Split large writes across turns. "
+                + " ".join(rejected[:4]))
 
 
 def _run_turn_stream_attempt(req: CanonRequest, cfg: Config, recovery_hint: str = "") -> Iterator[Tuple[str, Any]]:
@@ -189,10 +215,7 @@ def _run_turn_stream_attempt(req: CanonRequest, cfg: Config, recovery_hint: str 
             return
         issues = _call_issues(tc, req, tools_by_name)
         if issues:
-            if req.tool_choice not in ("auto", "none", "required") and tc.name != req.tool_choice:
-                raise UpstreamError("model did not call the requested tool `%s`" % req.tool_choice, 502)
-            yield ("text", "\n\n[tool guard] Rejected tool call: " + " ".join(issues))
-            any_text = True
+            yield ("rejected", " ".join(issues))
             return
         if seen_this_turn.get(fp, 0) >= 1:
             return
@@ -243,8 +266,8 @@ def _run_turn_stream_attempt(req: CanonRequest, cfg: Config, recovery_hint: str 
         for out in consider(tc):
             yield out
 
-    if allow_tools and req.tool_choice not in ("auto", "none") and not emitted_calls and any_text:
-        raise UpstreamError("model failed to satisfy tool_choice=%s" % req.tool_choice, 502)
+    if allow_tools and req.tool_choice not in ("auto", "none") and not emitted_calls:
+        yield ("required_missing", True)
     if not any_text and not emitted_calls:
         yield ("empty", True)
 
