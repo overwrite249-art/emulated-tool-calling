@@ -1,13 +1,27 @@
 """Offline tests for the opt-in paid benchmark's accounting and continuation."""
 import hashlib
+import json
+import urllib.error
+import urllib.request
 from pathlib import Path
 import tempfile
 import unittest
-from benchmarks.fullstack.budget import usage_upper_bound
+from benchmarks.fullstack.budget import BudgetBridge, usage_upper_bound
 from benchmarks.fullstack.source import copy_source
 
 
 class BudgetTests(unittest.TestCase):
+    def test_bridge_lifecycle_and_limit_without_paid_requests(self):
+        with tempfile.TemporaryDirectory() as d:
+            bridge=BudgetBridge('dummy',Path(d)/'meter.jsonl',limit=0,upstream='http://127.0.0.1:9/unused')
+            try:
+                url=bridge.start()
+                body=json.dumps({'model':'deepseek-v4-pro','messages':[],'max_tokens':1}).encode()
+                request=urllib.request.Request(url,data=body,headers={'Authorization':'Bearer '+bridge.token,'Content-Type':'application/json'})
+                with self.assertRaises(urllib.error.HTTPError) as failure:urllib.request.urlopen(request,timeout=2)
+                self.assertEqual(failure.exception.code,402)
+                self.assertEqual(bridge.summary()['requests'],0)
+            finally:bridge.stop()
     def cost(self,**kw):return usage_upper_bound(dict(prompt_tokens=100,completion_tokens=50,**kw),.25)
     def test_cache_miss_default(self):self.assertAlmostEqual(self.cost(),.00033)
     def test_verified_cache_hits(self):self.assertAlmostEqual(self.cost(prompt_cache_hit_tokens=80,prompt_cache_miss_tokens=20),.00022792)
