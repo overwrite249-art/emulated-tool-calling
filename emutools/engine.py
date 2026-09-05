@@ -39,7 +39,7 @@ def _estimate_input_tokens(payload: Dict[str, Any]) -> int:
 def _prepare(req: CanonRequest, cfg: Config) -> Tuple[LoopState, List[str], bool]:
     st = analyze_history(req.messages, cfg)
     extra = list(st.nudges)
-    allow_tools = not st.budget_exhausted
+    allow_tools = bool(req.tools) and req.tool_choice != "none" and not st.budget_exhausted
     if st.budget_exhausted:
         extra.append(BUDGET_MESSAGE)
         log_warn(
@@ -48,12 +48,23 @@ def _prepare(req: CanonRequest, cfg: Config) -> Tuple[LoopState, List[str], bool
     return st, extra, allow_tools
 
 
+def _call_limit(req: CanonRequest, cfg: Config) -> int:
+    return max(0, cfg.max_calls_per_turn) if cfg.parallel and req.parallel_tool_calls is not False else min(1, max(0, cfg.max_calls_per_turn))
+
+
+def _call_issues(tc: ToolCall, req: CanonRequest, tools: Dict[str, ToolDef]) -> List[str]:
+    if tc.name not in tools:
+        return ["Tool `%s` does not exist. Available tools: %s." % (tc.name, ", ".join(sorted(tools)) or "(none)")]
+    if req.tool_choice not in ("auto", "required", "none", tc.name):
+        return ["Tool `%s` is not the requested tool `%s`." % (tc.name, req.tool_choice)]
+    return ["Call to `%s` is invalid: %s." % (tc.name, issue) for issue in validate_args(tc.args, tools[tc.name].schema)]
+
+
 def run_turn(req: CanonRequest, cfg: Config) -> TurnResult:
-    """Non-streaming: one client turn, with repair/loop retries."""
+    """Bounded repairs; no rejected or schema-invalid call can reach a client."""
     st, extra, allow_tools = _prepare(req, cfg)
     tools_by_name = _tools_by_name(req)
-    notes: List[str] = []
-    result = TurnResult()
+    total_usage: Dict[str, Any] = {}
     max_attempts = 3 if cfg.loop_retry else 1
 
     for attempt in range(1, max_attempts + 1):
@@ -61,108 +72,52 @@ def run_turn(req: CanonRequest, cfg: Config) -> TurnResult:
         data = upstream_complete(cfg, payload)
         content, finish_reason, usage = extract_completion_text(data)
         text, calls = extract_tool_calls(content, tools_by_name, cfg.salvage_bare_json)
-
         if not usage:
-            usage = {
-                "prompt_tokens": _estimate_input_tokens(payload),
-                "completion_tokens": estimate_tokens(content),
-            }
-
-        result = TurnResult(text=text, calls=calls, usage=usage, attempts=attempt)
-
+            usage = {"prompt_tokens": _estimate_input_tokens(payload), "completion_tokens": estimate_tokens(content)}
+        for key, value in usage.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                total_usage[key] = total_usage.get(key, 0) + value
+        notes: List[str] = []
         if not allow_tools and calls:
-            notes.append(
-                "Tool-call budget reached (%d rounds); ignored %d further tool call(s)."
-                % (st.rounds, len(calls))
-            )
+            notes.append("Tool calls are disabled for this turn (choice or conversation budget); ignored %d call(s)." % len(calls))
             calls = []
-            result.calls = []
-
-        kept, blocked = filter_calls_for_loops(calls, st, cfg)
-
-        # Retry once when loop protection nuked every call the model wanted.
-        if blocked and not kept and attempt < max_attempts and allow_tools:
-            log_warn("loop guard blocked all calls; retrying with escalation")
-            extra = list(extra) + [
-                "CRITICAL: "
-                + " ".join(blocked)
-                + " Do not emit that call again. Either use a genuinely different tool or "
-                "arguments, or stop calling tools and give your final answer now."
-            ]
-            continue
-
-        # Validate arguments; one repair round-trip if the model got them wrong.
+        valid: List[ToolCall] = []
         problems: List[str] = []
-        for tc in kept:
-            tdef = tools_by_name.get(tc.name)
-            if tdef is None:
-                problems.append(
-                    "Tool `%s` does not exist. Available tools: %s."
-                    % (tc.name, ", ".join(sorted(tools_by_name)) or "(none)")
-                )
-                continue
-            issues = validate_args(tc.args, tdef.schema)
+        for tc in calls:
+            issues = _call_issues(tc, req, tools_by_name)
             if issues:
-                problems.append(
-                    "Call to `%s` is invalid: %s. Emit the call again, corrected."
-                    % (tc.name, "; ".join(issues))
-                )
-        if problems and attempt < max_attempts:
-            log_warn("invalid tool args, repairing: %s" % problems[0][:160])
-            extra = list(extra) + ["Your previous tool call was rejected. " + " ".join(problems)]
+                problems.extend(issues)
+            else:
+                valid.append(tc)
+        kept, blocked = filter_calls_for_loops(valid, st, cfg)
+        limit = _call_limit(req, cfg)
+        if len(kept) > limit:
+            blocked.append("Dropped extra calls: at most %d tool call(s) allowed in this turn." % limit)
+            kept = kept[:limit]
+        requires_call = allow_tools and req.tool_choice not in ("auto", "none")
+        retry_reasons = list(problems)
+        if blocked and not kept:
+            retry_reasons.extend(blocked)
+        if requires_call and not kept:
+            retry_reasons.append("This turn REQUIRES a valid call to the requested tool. Output only that call, corrected.")
+        if retry_reasons and attempt < max_attempts:
+            log_warn("retrying rejected tool output: %s" % retry_reasons[0][:160])
+            extra = list(extra) + ["CRITICAL: Your previous tool call was rejected. " + " ".join(retry_reasons)]
             continue
-        if problems:
-            notes.extend(problems)
-            kept = [tc for tc in kept if tc.name in tools_by_name]
-
-        # tool_choice=required but the model answered in prose.
-        if (
-            allow_tools
-            and req.tools
-            and req.tool_choice not in ("auto", "none")
-            and not kept
-            and attempt < max_attempts
-        ):
-            log_warn("tool_choice=%s but no call produced; retrying" % req.tool_choice)
-            extra = list(extra) + [
-                "You did not emit a tool call. This turn REQUIRES one. Output only a "
-                "<tool_call> block now, nothing else."
-            ]
-            continue
-
-        # Loop guard explanation must be applied BEFORE the empty-response fallback,
-        # otherwise a fully-blocked turn looks like an empty upstream reply.
-        if blocked:
-            notes.extend(blocked)
-            if not kept and not text.strip():
-                text = (
-                    "I stopped because I was about to repeat a tool call I have already "
-                    "made with identical arguments. " + " ".join(blocked)
-                )
-
-        # Empty response guard - clients crash on empty content.
+        if requires_call and not kept:
+            raise UpstreamError("model failed to satisfy tool_choice=%s after %d attempt(s)" % (req.tool_choice, attempt), 502)
+        notes.extend(problems + blocked)
         if not text.strip() and not kept:
-            if attempt < max_attempts:
-                log_warn("empty upstream response; retrying once")
-                extra = list(extra) + [
-                    "Your previous reply was empty. Produce a substantive reply now."
-                ]
+            if notes:
+                text = "I stopped without executing the rejected tool call. " + " ".join(notes)
+            elif attempt < max_attempts:
+                extra = list(extra) + ["Your previous reply was empty. Produce a substantive reply now."]
                 continue
-            text = EMPTY_FALLBACK
-
-        result.text = text
-        result.calls = kept
-        result.notes = notes
-        result.finish = "tool_calls" if kept else (
-            "length" if finish_reason in ("length", "max_tokens") else "stop"
-        )
-        return result
-
-    result.notes = notes
-    if not result.text.strip() and not result.calls:
-        result.text = EMPTY_FALLBACK
-    result.finish = "tool_calls" if result.calls else "stop"
-    return result
+            else:
+                text = EMPTY_FALLBACK
+        return TurnResult(text=text, calls=kept, usage=total_usage, notes=notes, attempts=attempt,
+                          finish="tool_calls" if kept else ("length" if finish_reason in ("length", "max_tokens") else "stop"))
+    raise AssertionError("unreachable: at least one completion attempt is required")
 
 
 def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]:
@@ -189,16 +144,15 @@ def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]
         if not allow_tools:
             yield (
                 "text",
-                "\n\n[loop guard] Tool budget of %d calls is exhausted, so I stopped "
-                "calling tools." % cfg.max_tool_rounds,
+                "\n\n[tool guard] Tool calls are disabled for this turn (choice or conversation budget).",
             )
             any_text = True
             return
-        if tc.name not in tools_by_name:
-            yield (
-                "text",
-                "\n\n[error] The model tried to call an unknown tool `%s`." % tc.name,
-            )
+        issues = _call_issues(tc, req, tools_by_name)
+        if issues:
+            if req.tool_choice not in ("auto", "none", "required") and tc.name != req.tool_choice:
+                raise UpstreamError("model did not call the requested tool `%s`" % req.tool_choice, 502)
+            yield ("text", "\n\n[tool guard] Rejected tool call: " + " ".join(issues))
             any_text = True
             return
         if seen_this_turn.get(fp, 0) >= 1:
@@ -211,7 +165,7 @@ def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]
             )
             any_text = True
             return
-        if len(emitted_calls) >= cfg.max_calls_per_turn:
+        if len(emitted_calls) >= _call_limit(req, cfg):
             return
         seen_this_turn[fp] = 1
         emitted_calls.append(tc)
@@ -250,6 +204,8 @@ def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]
         for out in consider(tc):
             yield out
 
+    if allow_tools and req.tool_choice not in ("auto", "none") and not emitted_calls:
+        raise UpstreamError("model failed to satisfy tool_choice=%s" % req.tool_choice, 502)
     if not any_text and not emitted_calls:
         yield ("text", EMPTY_FALLBACK)
 
@@ -398,24 +354,8 @@ def anthropic_stream_bytes(req: CanonRequest, cfg: Config) -> Iterator[bytes]:
                 finish = value
     except UpstreamError as exc:
         log_error("stream failed: %s" % exc.message)
-        if not text_open:
-            yield sse(
-                "content_block_start",
-                {
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": {"type": "text", "text": ""},
-                },
-            )
-            text_open = True
-        yield sse(
-            "content_block_delta",
-            {
-                "type": "content_block_delta",
-                "index": index,
-                "delta": {"type": "text_delta", "text": "\n\n[upstream error] " + exc.message},
-            },
-        )
+        yield sse("error", {"type": "error", "error": {"type": "api_error", "message": exc.message}})
+        return
 
     if text_open:
         yield sse("content_block_stop", {"type": "content_block_stop", "index": index})
@@ -428,7 +368,7 @@ def anthropic_stream_bytes(req: CanonRequest, cfg: Config) -> Iterator[bytes]:
         {
             "type": "message_delta",
             "delta": {"stop_reason": _ANTHROPIC_STOP.get(finish, "end_turn"), "stop_sequence": None},
-            "usage": {"output_tokens": u["output_tokens"]},
+            "usage": u,
         },
     )
     yield sse("message_stop", {"type": "message_stop"})
@@ -539,7 +479,9 @@ def openai_stream_bytes(req: CanonRequest, cfg: Config, include_usage: bool) -> 
                 finish = value
     except UpstreamError as exc:
         log_error("stream failed: %s" % exc.message)
-        yield chunk({"content": "\n\n[upstream error] " + exc.message})
+        error = {"error": {"message": exc.message, "type": "api_error", "code": exc.status}}
+        yield ("data: %s\n\n" % json.dumps(error)).encode("utf-8")
+        return
 
     yield chunk({}, finish)
 
@@ -581,6 +523,8 @@ __all__ = [
     "_tools_by_name",
     "_estimate_input_tokens",
     "_prepare",
+    "_call_limit",
+    "_call_issues",
     "run_turn",
     "run_turn_stream",
     "_ANTHROPIC_STOP",

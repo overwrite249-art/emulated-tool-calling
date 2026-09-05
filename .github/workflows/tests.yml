@@ -1,0 +1,142 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile source
+        run: python -m compileall -q emutools tests scripts
+      - name: Regression and real-socket tests
+        run: python -m unittest discover -s tests -v
+      - name: Built-in 200-check suite
+        run: python -m emutools --selftest
+      - name: Build and test standalone distribution
+        run: |
+          python build_single_file.py "$RUNNER_TEMP/emutools.py"
+          python "$RUNNER_TEMP/emutools.py" --selftest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: emutools-python-${{ matrix.python-version }}
+          path: ${{ runner.temp }}/emutools.py
+          if-no-files-found: error
+
+  real-cli:
+    permissions:
+      contents: read
+      pull-requests: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        client: [claude, opencode]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned official CLI binary
+        env:
+          CLIENT: ${{ matrix.client }}
+        run: |
+          exec > >(tee "$RUNNER_TEMP/cli-install.log") 2>&1
+          mkdir -p "$RUNNER_TEMP/cli"
+          if [ "$CLIENT" = claude ]; then
+            URL='https://registry.npmjs.org/@anthropic-ai/claude-code-linux-x64/-/claude-code-linux-x64-2.1.261.tgz'
+            BIN="$RUNNER_TEMP/cli/package/claude"
+          else
+            URL='https://registry.npmjs.org/opencode-linux-x64-baseline/-/opencode-linux-x64-baseline-1.18.29.tgz'
+            BIN="$RUNNER_TEMP/cli/package/bin/opencode"
+          fi
+          curl --fail --silent --show-error --location "$URL" | tar xz -C "$RUNNER_TEMP/cli"
+          echo "CLI_BIN=$BIN" >> "$GITHUB_ENV"
+          "$BIN" --version
+      - name: Real CLI and MCP tools against deterministic model
+        env:
+          CLIENT: ${{ matrix.client }}
+        run: |
+          python scripts/live_cli_smoke.py --client "$CLIENT" --cli "$CLI_BIN" \
+            --out-dir "$RUNNER_TEMP/cli-smoke" --mock-upstream --timeout 120
+      - name: Diagnostics
+        if: always()
+        run: |
+          for file in result.json client.stderr proxy.log; do
+            if [ -f "$RUNNER_TEMP/cli-smoke/$file" ]; then cat "$RUNNER_TEMP/cli-smoke/$file"; fi
+          done
+          if [ -f "$RUNNER_TEMP/cli-smoke/client.jsonl" ]; then tail -n 15 "$RUNNER_TEMP/cli-smoke/client.jsonl"; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cli-smoke-${{ matrix.client }}
+          path: |
+            ${{ runner.temp }}/cli-smoke/result.json
+            ${{ runner.temp }}/cli-smoke/client.stderr
+            ${{ runner.temp }}/cli-smoke/proxy.log
+            ${{ runner.temp }}/cli-smoke/fixture/greeting.py
+          if-no-files-found: warn
+      - name: Publish concise same-repository PR test evidence
+        if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v7
+        env:
+          CLIENT: ${{ matrix.client }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const root = process.env.RUNNER_TEMP;
+            const client = process.env.CLIENT;
+            const marker = `<!-- emutools-cli-${client} -->`;
+            const sections = [`${marker}\n### Real CLI test: ${client}\nModel: deterministic local mock (no paid API).\nCommit: ${context.payload.pull_request.head.sha}`];
+            for (const file of ['cli-install.log', 'cli-smoke/result.json', 'cli-smoke/client.stderr', 'cli-smoke/proxy.log']) {
+              const name = path.join(root, file);
+              if (fs.existsSync(name)) {
+                const text = fs.readFileSync(name, 'utf8').slice(-6000).replace(/```/g, "'''");
+                if (text.trim()) sections.push(`#### ${file}\n\n\`\`\`text\n${text}\n\`\`\``);
+              }
+            }
+            const transcript = path.join(root, 'cli-smoke/client.jsonl');
+            if (fs.existsSync(transcript)) {
+              const notes = [];
+              for (const line of fs.readFileSync(transcript, 'utf8').split('\n')) {
+                try {
+                  const r = JSON.parse(line);
+                  if (r.type === 'error') notes.push(r.error);
+                  if (r.type === 'tool_use') notes.push({tool: r.part?.tool, status: r.part?.state?.status, error: r.part?.state?.error});
+                } catch {}
+              }
+              if (notes.length) sections.push('Client events: ' + JSON.stringify(notes).slice(-6000));
+            }
+            const logDir = path.join(root, 'cli-smoke/home/.local/share/opencode/log');
+            if (fs.existsSync(logDir)) {
+              for (const file of fs.readdirSync(logDir).filter(x => x.endsWith('.log')).slice(-3)) {
+                const errors = fs.readFileSync(path.join(logDir, file), 'utf8').split('\n').filter(x => /error|fatal|panic/i.test(x)).join('\n').slice(-8000);
+                if (errors) sections.push('OpenCode server errors:\n' + errors.replace(/ses_[a-zA-Z0-9]+/g, '<session>'));
+              }
+            }
+            const body = sections.join('\n\n');
+            const args = {...context.repo, issue_number: context.issue.number};
+            const comments = await github.rest.issues.listComments({...args, per_page: 100});
+            const old = comments.data.find(c => c.user.type === 'Bot' && c.body.startsWith(marker));
+            if (old) await github.rest.issues.updateComment({...context.repo, comment_id: old.id, body});
+            else await github.rest.issues.createComment({...args, body});

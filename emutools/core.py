@@ -67,10 +67,14 @@ class Config:
 
     # Emulation behaviour
     parallel: bool = field(default_factory=lambda: _env_bool("EMU_PARALLEL", False))
-    use_stop: bool = field(default_factory=lambda: _env_bool("EMU_USE_STOP", True))
+    use_stop: bool = field(default_factory=lambda: _env_bool("EMU_USE_STOP", False))
     merge_roles: bool = field(default_factory=lambda: _env_bool("EMU_MERGE_ROLES", True))
     salvage_bare_json: bool = field(default_factory=lambda: _env_bool("EMU_SALVAGE", True))
     max_result_chars: int = field(default_factory=lambda: _env_int("EMU_MAX_RESULT_CHARS", 24000))
+
+    # Inbound HTTP resource limits (the server is intended for loopback use).
+    max_request_bytes: int = field(default_factory=lambda: _env_int("EMU_MAX_REQUEST_BYTES", 16 * 1024 * 1024))
+    client_timeout: float = field(default_factory=lambda: _env_float("EMU_CLIENT_TIMEOUT", 30.0))
 
     # Upstream transport
     timeout: float = field(default_factory=lambda: _env_float("EMU_TIMEOUT", 300.0))
@@ -82,10 +86,20 @@ class Config:
     def model_map(self) -> Dict[str, str]:
         if not self.model_map_raw.strip():
             return {}
+        raw = self.model_map_raw.strip()
+        if not raw.startswith("{"):
+            mapping: Dict[str, str] = {}
+            for item in raw.split(","):
+                key, sep, value = item.partition("=")
+                if not sep or not key.strip() or not value.strip():
+                    log_warn("EMU_MODEL_MAP must be JSON or comma-separated from=to pairs; ignoring")
+                    return {}
+                mapping[key.strip()] = value.strip()
+            return mapping
         try:
-            data = json.loads(self.model_map_raw)
+            data = json.loads(raw)
             if isinstance(data, dict):
-                return {str(k): str(v) for k, v in data.items()}
+                return {k: v for k, v in data.items() if k and isinstance(v, str) and v}
         except (ValueError, TypeError):
             log_warn("EMU_MODEL_MAP is not valid JSON; ignoring")
         return {}
@@ -253,6 +267,7 @@ class CanonRequest:
     top_p: Optional[float] = None
     stop: List[str] = field(default_factory=list)
     stream: bool = False
+    parallel_tool_calls: Optional[bool] = None
     protocol: str = "anthropic"  # anthropic | openai
 
 

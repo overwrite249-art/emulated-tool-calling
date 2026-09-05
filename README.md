@@ -1,227 +1,232 @@
 # emutools
 
-**Emulated tool calling for models that don't do it natively — with no client-side changes.**
+[![Tests](https://github.com/overwrite249-art/emulated-tool-calling/actions/workflows/tests.yml/badge.svg)](https://github.com/overwrite249-art/emulated-tool-calling/actions/workflows/tests.yml)
 
-A local proxy that speaks both wire protocols coding agents use, and translates them onto
-any OpenAI-compatible backend *without using that backend's native tool-calling support*.
+**Tool calling for coding clients through a text-only, OpenAI-compatible model backend.**
 
-- **Anthropic Messages API** — `POST /v1/messages` (Claude Code CLI)
-- **OpenAI Chat Completions** — `POST /v1/chat/completions` (opencode, aider, cline, ...)
+emutools is a dependency-free Python 3.9+ proxy. It accepts Anthropic Messages or OpenAI
+Chat Completions, renders tool schemas into the prompt, and turns the model's text back
+into native `tool_use` / `tool_calls` responses. It never sends a native `tools` field upstream.
 
-Tool calls are **emulated**: schemas are rendered into the system prompt, the model answers
-in plain text, and the proxy parses that text back into genuine `tool_use` / `tool_calls`
-structures. The client believes it is talking to a native tool-calling model. The upstream
-model never receives a `tools` field at all.
-
-Zero dependencies. Python 3.9+. **200 self-tests, all passing, no network required.**
-
----
+- **Claude Code:** Anthropic Messages, including streaming and token counting.
+- **OpenAI-compatible clients:** Chat Completions, including streaming tool arguments and usage.
+- **MCP tools:** tools registered by the client are translated like other client tools; emutools is not itself an MCP server.
 
 ## Quick start
 
 ```bash
-export EMU_UPSTREAM_API_KEY=sk-...        # or DEEPSEEK_API_KEY
+export EMU_UPSTREAM_API_KEY=sk-...  # or DEEPSEEK_API_KEY; never commit your real key
 python3 -m emutools
 ```
 
-Point either client at it:
+The default upstream is `https://api.deepseek.com`, routing main models to
+`deepseek-v4-pro` and small/fast aliases to `deepseek-v4-flash`.
+
+### Claude Code
 
 ```bash
-# Claude Code CLI
-ANTHROPIC_BASE_URL=http://127.0.0.1:8787 ANTHROPIC_AUTH_TOKEN=dummy claude
-
-# opencode / any OpenAI-compatible client
-OPENAI_BASE_URL=http://127.0.0.1:8787/v1 OPENAI_API_KEY=dummy opencode
+ANTHROPIC_BASE_URL=http://127.0.0.1:8787 ANTHROPIC_API_KEY=dummy claude
 ```
 
-The client-side key is ignored — the proxy authenticates upstream itself. **No API key is
-stored in this repository; it is read from the environment only.**
+The client-side key is not an upstream credential. The proxy reads the real key from
+its own environment. For the `claude --bare` mode used by the smoke test, supply
+`ANTHROPIC_API_KEY`, not only an auth token.
 
-Verify everything without a network or a key:
+### OpenCode
+
+Use an explicit OpenAI-compatible provider in `opencode.json` rather than relying on
+`OPENAI_BASE_URL` alone:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "emutools/deepseek-v4-pro",
+  "provider": {
+    "emutools": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "emutools",
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1",
+        "apiKey": "dummy"
+      },
+      "models": {
+        "deepseek-v4-pro": {"name": "DeepSeek V4 Pro"}
+      }
+    }
+  }
+}
+```
 
 ```bash
-python3 -m emutools --selftest
+opencode run --model emutools/deepseek-v4-pro "Describe this project"
 ```
 
-## Single-file deploy
-
-The package layout exists so the code is reviewable. For deployment there is one file:
+For other clients that support these environment variables:
 
 ```bash
-python3 build_single_file.py     # -> ./emutools.py
-python3 emutools.py --selftest   # same 200 checks
-python3 emutools.py              # start the proxy
+export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
+export OPENAI_API_KEY=dummy
 ```
 
-That output is dependency-free and self-contained — scp it anywhere with Python 3.9+.
+**Keep the proxy on loopback.** Client credentials are not checked. Do not expose it to
+an untrusted network without an authenticated reverse proxy and appropriate access controls.
+Keep your coding client's tool permissions enabled.
+
+## What the hardening fixes
+
+- Incremental UTF-8 decoding preserves Unicode and DeepSeek DSML markers split across
+  network reads. `read1()` avoids waiting for a full buffer before forwarding an SSE event.
+- Multiline SSE data, CRLF boundaries and EOF are handled as complete events. Broken
+  upstream streams produce protocol errors, not successful-looking assistant replies.
+- Literal `</tool_call>`, `<arg>` and DSML markup inside JSON arguments remain data rather
+  than being mistaken for syntax or silently rewritten.
+- A fabricated `<tool_result>` discards the entire dependent continuation, including
+  additional calls that relied on a tool result which never existed.
+- Unterminated JSON strings are not invented. Bare JSON salvage is held back until it can
+  be classified, avoiding visible JSON followed by a duplicate tool call.
+- `tool_choice=none`, named tool choice, schema validation and call limits are enforced
+  before calls reach clients—not merely requested in the model prompt.
+- Inbound request validation returns 400/413/408 for invalid, oversized or timed-out
+  bodies. Chunked requests share the size limit and reject ambiguous/truncated framing.
+- Server instances use their own configuration. Model-map syntax matches the docs.
+- Anthropic streams report input usage; non-streaming repair attempts accumulate usage.
 
 ## Endpoints
 
 | Route | Purpose |
 | --- | --- |
-| `POST /v1/messages` | Anthropic Messages API — Claude Code |
-| `POST /v1/messages/count_tokens` | Token estimate (Claude Code calls this) |
-| `POST /v1/chat/completions` | OpenAI Chat Completions — opencode |
-| `POST /chat/completions` | Same, unprefixed |
-| `GET /v1/models` | Model list for both clients |
-| `GET /health` | Liveness probe |
+| `POST /v1/messages` or `/messages` | Anthropic Messages |
+| `POST /v1/messages/count_tokens` or `/messages/count_tokens` | Approximate input token count |
+| `POST /v1/chat/completions` or `/chat/completions` | OpenAI Chat Completions |
+| `GET /v1/models` or `/models` | Aliases and configured upstream model IDs |
+| `GET /health` or `/healthz` | Liveness and non-secret configuration |
 
-Streaming and non-streaming are implemented on both APIs, including correct Anthropic SSE
-framing (`message_start`, `content_block_start`, `input_json_delta`, `message_delta`,
-`message_stop`) and OpenAI `tool_calls` deltas.
+The OpenAI **Responses API** and legacy text `/v1/completions` are not implemented.
+In particular, this is not a claim of Codex CLI compatibility.
 
-## The wire protocol given to the model
+## Emulated wire format
 
-```
+```text
 <tool_call>
-{"name": "Read", "arguments": {"file_path": "/etc/hosts"}}
+{"name":"Read","arguments":{"file_path":"/tmp/example.txt"}}
 </tool_call>
 ```
 
-The parser is deliberately forgiving, because real models are messy. It accepts:
+The parser also handles common tag aliases, raw XML-style arguments, single-quoted
+pseudo-JSON, trailing commas, Python literals, and missing structural closing tags.
+DeepSeek's fullwidth `｜｜DSML｜｜` markup is recognized at syntax boundaries without
+normalizing literal argument content.
 
-- Tag aliases: `tool_call`, `tool-call`, `toolcall`, `function_call`, `tool_use`, `invoke`
-- XML-style args: `<parameter name="x">value</parameter>` instead of JSON
-- Attribute style: `<tool_call name="Read">`
-- Markdown fences around or inside the block
-- Single quotes, trailing commas, unquoted keys, Python `True` / `None`
-- A missing closing tag, because the stop sequence cut the response off
-- **Vendor-native markup leaking into the text channel** (see below)
+**`EMU_USE_STOP` now defaults to `false`.** A literal `</tool_call>` stop sequence can cut
+file content mid-string. Opt in with `EMU_USE_STOP=true` only when that trade-off is
+acceptable; the missing close-tag recovery remains available.
 
-With `EMU_USE_STOP` on, the proxy sends `stop: ["</tool_call>"]` upstream so the model
-cannot ramble past a call, then repairs the missing closing tag.
+## Tool policy and loop protection
 
-### Anti-hallucination
+Loop state is reconstructed from each request's transcript, not shared between users:
+identical-call fingerprints, repeat warnings, hard repeat limits, oscillation detection,
+a conversation tool-round budget, and a per-turn call cap.
 
-The most common failure of emulated tool calling is the model **writing the tool result
-itself** and then reasoning against imaginary data. The proxy strips any `tool_result` the
-model emits, discards everything after it, and the prompt forbids it explicitly. Covered by
-tests in both the batch and streaming paths.
+With `EMU_PARALLEL=false`, at most one call is forwarded. With it enabled, the configured
+per-turn cap applies; a client's `parallel_tool_calls=false` or Anthropic
+`disable_parallel_tool_use=true` can still disable parallel calls.
 
-## Loop protection
+Non-streaming rejected calls can be retried up to three times with corrective instructions
+when `EMU_LOOP_RETRY=true`. Invalid calls remain blocked after the last attempt. Streaming
+calls are validated before emission but are not silently re-run after partial output.
+An unsatisfied required/named tool choice returns a protocol error.
 
-Five independent mechanisms, because "it must not spin forever" was the hard requirement:
-
-1. **Identical-call detection** — args are canonicalised (sorted keys, normalised
-   whitespace) and fingerprinted; repeats are counted across the whole conversation.
-2. **Escalating nudge** — one call *before* the limit, a warning is injected telling the
-   model it already ran that exact call and must use the result it has.
-3. **Hard block** — at `EMU_MAX_REPEAT` the call is refused and the client is told why, in
-   plain language, so the agent can recover instead of stalling.
-4. **Round budget** — `EMU_MAX_TOOL_ROUNDS` counts tool-calling turns; on exhaustion the
-   proxy forces a final text-only answer by re-asking with tools disabled.
-5. **Per-turn cap** — `EMU_MAX_CALLS_PER_TURN` stops one response fanning out into dozens.
-
-The critical detail: **it never returns an empty response.** Every terminal state produces
-real text, which is what stops the *client* from starting a retry loop of its own.
-
-The proxy is stateless, like the APIs it emulates: loop state is rebuilt from the
-transcript on every request, so protection survives client restarts and works correctly
-with many interleaved conversations.
+Schema validation supports common recursive keywords: types, local `#/...` references,
+properties/required/items, additional and pattern properties, enum/const, combinators,
+common numeric/string/array bounds, and unique items. It is a bounded **subset of JSON
+Schema**, not a complete validator; unsupported keywords and external references are not
+implemented. Client permissions remain the authority for executing tools.
 
 ## Configuration
-
-Every setting is an environment variable; the important ones also have CLI flags.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `EMU_HOST` / `EMU_PORT` | `127.0.0.1` / `8787` | Listen address |
-| `EMU_UPSTREAM_BASE_URL` | `https://api.deepseek.com` | Any OpenAI-compatible backend |
+| `EMU_UPSTREAM_BASE_URL` | `https://api.deepseek.com` | OpenAI-compatible backend |
+| `EMU_UPSTREAM_PATH` | `/chat/completions` | Upstream route |
 | `EMU_UPSTREAM_API_KEY` | — | Falls back to `DEEPSEEK_API_KEY` |
-| `EMU_MODEL_BIG` / `EMU_MODEL_SMALL` | `deepseek-v4-pro` / `deepseek-v4-flash` | Targets for opus/sonnet vs haiku |
-| `EMU_MODEL_MAP` | — | Explicit `from=to` overrides, comma separated |
-| `EMU_MAX_TOOL_ROUNDS` | `25` | Tool rounds before a forced answer |
-| `EMU_MAX_REPEAT` | `3` | Identical calls before blocking |
-| `EMU_MAX_CALLS_PER_TURN` | `4` | Calls allowed in one response |
-| `EMU_PARALLEL` | `false` | Allow multiple calls per turn |
-| `EMU_USE_STOP` | `true` | Send the stop sequence upstream |
-| `EMU_SALVAGE` | `true` | Recover malformed calls |
-| `EMU_MAX_RESULT_CHARS` | `24000` | Middle-truncate huge tool results |
-| `EMU_TIMEOUT` / `EMU_MAX_RETRIES` | `300` / `3` | Upstream timeout and retry budget |
-| `EMU_LOG` / `EMU_LOG_BODIES` | `info` / `false` | Log level and body dumps |
+| `EMU_MODEL_BIG` / `EMU_MODEL_SMALL` | `deepseek-v4-pro` / `deepseek-v4-flash` | Main and small-model targets |
+| `EMU_MODEL_MAP` | — | Comma-separated `from=to` pairs or a JSON object |
+| `EMU_MAX_TOOL_ROUNDS` | `25` | Tool-calling turns before forcing an answer |
+| `EMU_MAX_REPEAT` | `3` | Identical-call hard limit |
+| `EMU_MAX_CALLS_PER_TURN` | `4` | Cap when parallel calling is enabled |
+| `EMU_PARALLEL` | `false` | Otherwise enforce one call per turn |
+| `EMU_USE_STOP` | `false` | Opt-in closing-tag stop; can truncate literal code |
+| `EMU_LOOP_RETRY` | `true` | Bounded non-streaming corrective retries |
+| `EMU_SALVAGE` | `true` | Recover bare JSON calls |
+| `EMU_MAX_RESULT_CHARS` | `24000` | Middle-truncate long tool results |
+| `EMU_MAX_REQUEST_BYTES` | `16777216` | 16 MiB limit for length and chunked bodies |
+| `EMU_CLIENT_TIMEOUT` | `30` | Client socket timeout in seconds |
+| `EMU_TIMEOUT` / `EMU_MAX_RETRIES` | `300` / `3` | Upstream timeout and connection attempts |
+| `EMU_LOG` / `EMU_LOG_BODIES` | `info` / `false` | Logging; body dumps can contain sensitive prompts |
 
 ```bash
-python3 -m emutools --port 9000 --max-repeat 2 --max-tool-rounds 15 --log debug
+EMU_MODEL_MAP='my-model=deepseek-v4-pro,tiny=deepseek-v4-flash' \
+  python3 -m emutools --port 9000 --max-repeat 2 --max-tool-rounds 15
 ```
 
-## A real bug this found
+## Tests and single-file deployment
 
-Streaming against the live API with a deliberately weak system prompt, the model ignored
-the requested format and emitted **its own native tool-call markup into the text channel**,
-using fullwidth `U+FF5C` sentinels:
-
-```
-<｜｜DSML｜｜tool_calls>
-<｜｜DSML｜｜invoke name="Read">
-<｜｜DSML｜｜parameter name="file_path" string="true">/etc/hosts</｜｜DSML｜｜parameter>
-</｜｜DSML｜｜invoke>
-</｜｜DSML｜｜tool_calls>
+```bash
+python3 -m unittest discover -s tests -v  # 53 regressions, including real sockets
+python3 -m emutools --selftest            # 200 built-in checks and parser fuzzing
+python3 build_single_file.py /tmp/emutools.py
+python3 /tmp/emutools.py --selftest       # same 200 checks, standalone
+python3 /tmp/emutools.py                  # dependency-free deployment
 ```
 
-A naive parser leaks all of that to the user as garbage **and loses the tool call**. Fixes:
-a dialect normaliser that rewrites vendor markup into canonical tags in both the batch and
-streaming paths, and a prompt rule forbidding the built-in tool-call channel. The exact SSE
-deltas the API really sent are now a permanent regression fixture.
+CI runs the package and standalone suites on **Python 3.9, 3.12 and 3.13**. A separate
+job downloads pinned official Claude Code and OpenCode binaries and runs actual MCP,
+read/edit and shell-test operations against a deterministic local model. That job needs
+no API secret; it does not measure the behavior of a real LLM.
 
-Writing that fix introduced a subtler bug the char-by-char streaming test caught at once:
-the normaliser matched a marker while its **second** sentinel character was still in flight,
-stranding a pipe and corrupting the tag. A lookahead requiring the next tag character fixed
-it.
+For opt-in **paid DeepSeek V4 Pro** testing with an installed client:
 
-## Tests
-
-```
-python3 -m emutools --selftest
-...
-All 200 checks passed.
+```bash
+export EMU_UPSTREAM_API_KEY=sk-...
+python3 scripts/live_cli_smoke.py --client claude --cli "$(command -v claude)" \
+  --out-dir /tmp/emutools-claude-smoke
+# Or: --client opencode --cli "$(command -v opencode)"
+# Use --mock-upstream to exercise the client/tools without paying for a model.
 ```
 
-| # | Section | Covers |
-| --- | --- | --- |
-| 1 | Parser happy paths | Every accepted tag and argument dialect |
-| 2 | Malformed output | Broken JSON, missing tags, junk around the block |
-| 3 | Escaping hazards | Nested quotes, backslashes, newlines, unicode |
-| 4 | Hallucinated results | Model inventing tool output — batch and streaming |
-| 5 | Schema validation | Unknown tools, missing required args, type coercion |
-| 6 | Streaming fuzz | Splits 1–39 plus 300 random split patterns |
-| 7 | Loop protection (unit) | Fingerprinting, counting, nudging, blocking |
-| 8 | End-to-end HTTP | Real sockets against a mock upstream, both APIs |
-| 9 | Multi-turn | Full agent sessions with several tool calls |
-| 10 | Loop protection (e2e) | A model that genuinely will not stop calling |
-| 11 | Error handling | Upstream 500s, timeouts, bad JSON, oversized results |
-| 12 | Endpoints and edges | Models, health, token counting, empty tools |
-| 13 | Concurrency | 16 simultaneous requests, no exceptions |
-| 14 | Real captured output | Actual upstream bytes, including the DSML dialect |
-| 15 | Multi-conversation isolation | 16 interleaved conversations, zero state bleed |
+The output directory must not already exist. The runner uses a disposable workspace,
+small output/turn limits, a wall-clock timeout and narrow tool permissions. The real key
+is supplied only to the proxy, not to the CLI or its stdio MCP process. Live costs are
+not the same as a client's estimate for the advertised Claude alias.
 
-Sections 8–15 start a real proxy and a real mock upstream on loopback sockets, so they
-exercise genuine network I/O rather than mocked function calls.
+See [the September 2026 test report](docs/testing-2026-09-05.md) for observed results and
+limits, including the small VPS's inability to start OpenCode under memory pressure.
 
 ## Layout
 
 | Path | Contents |
 | --- | --- |
-| `emutools/` | The package, split by concern |
-| `emutools/protocol.py` | Prompt construction, tool schema rendering |
-| `emutools/parsing.py` | Tolerant tool-call parser, dialect normaliser |
-| `emutools/streaming.py` | Incremental parser that never leaks partial tags |
-| `emutools/loops.py` | Loop detection and budgets |
-| `emutools/translate.py` | Anthropic and OpenAI requests to one canonical form |
-| `emutools/engine.py` | The turn loop |
-| `emutools/server.py` | The HTTP layer |
-| `emutools/selftest_*.py` | The 200-check suite |
-| `build_single_file.py` | Rebuilds the standalone `emutools.py` |
+| `emutools/core.py` | Configuration, canonical types, utilities |
+| `emutools/protocol.py` | Prompts, tolerant parsing, incremental tool parser, validation |
+| `emutools/wire.py` | Loop state, upstream HTTP/SSE, request translation |
+| `emutools/engine.py` | Policy enforcement, turns and response serialization |
+| `emutools/server.py` | HTTP framing, routes, request validation |
+| `emutools/selftest_*.py` | 200-check built-in suite |
+| `tests/` | Focused regressions and real-socket tests |
+| `scripts/live_cli_smoke.py` | Opt-in real-model or deterministic-model CLI test |
+| `scripts/cli_mock_upstream.py` | Deterministic model for real-client CI |
+| `build_single_file.py` | Standalone distribution builder |
 
-## Known limitations
+## Remaining limitations
 
-- Emulated calling costs prompt tokens: schemas ride along as text on every request. With
-  Claude Code's full toolset, expect roughly 800–2,000 extra prompt tokens per turn.
-- Weak models still occasionally malform a call. The parser salvages most cases, and a
-  malformed call degrades to visible text rather than a crash — but it is not magic.
-- `EMU_PARALLEL` is off by default. Most emulated models handle one call per turn far more
-  reliably than several.
-- Image and document content blocks become text placeholders, since the upstream is
-  text-only.
+- Emulation adds prompt tokens and depends on the model following a text protocol.
+- Validation and repair are defensive heuristics, not a guarantee that a tool call is safe.
+- Images, documents and audio are replaced with text placeholders; this is a text-only bridge.
+- Token counting is approximate when the upstream does not report usage.
+- Raw XML argument form cannot unambiguously represent its own argument-closing delimiter;
+  JSON is preferable for arbitrary source code.
+- No Responses API, native upstream tool-call streaming, or authenticated public serving.
 
 ## License
 
