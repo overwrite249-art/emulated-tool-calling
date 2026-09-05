@@ -121,7 +121,8 @@ def main():
                            "bash": {"*": "deny", "python3 test_greeting.py": "allow"}},
         }
         (fixture / "opencode.json").write_text(json.dumps(config), encoding="utf-8")
-        client_env.update(OPENCODE_DISABLE_AUTOUPDATE="true", OPENCODE_DISABLE_MODELS_FETCH="true")
+        client_env.update(OPENCODE_DISABLE_AUTOUPDATE="true", OPENCODE_DISABLE_MODELS_FETCH="true",
+                          OPENCODE_CONFIG=str(fixture / "opencode.json"), PWD=str(fixture))
         command = [args.cli, "--print-logs", "--log-level", "ERROR", "run", "--model", "emutools/deepseek-v4-pro", "--format", "json", prompt]
     mock = None
     if args.mock_upstream:
