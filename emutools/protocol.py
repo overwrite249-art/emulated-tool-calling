@@ -263,7 +263,11 @@ def _balance_braces(s: str) -> str:
     in_str_final = False
     for _, _ch, in_str in _walk_strings(s + " "):
         in_str_final = in_str
-    tail = '"' if in_str_final else ""
+    # Never invent the rest of a string: it may be a shell command or file body.
+    # Closing structural braces is safe only after the last value is complete.
+    if in_str_final:
+        return s
+    tail = ""
     while stack:
         tail += "}" if stack.pop() == "{" else "]"
     return s + tail
@@ -358,10 +362,12 @@ OPEN_TAG_NAMES = [
 ]
 
 _TAGS_ALT = "|".join(re.escape(t) for t in OPEN_TAG_NAMES)
-_OPEN_RE = re.compile(r"<(" + _TAGS_ALT + r")(\s[^>]*?)?\s*>", re.IGNORECASE)
+# Recognize vendor sentinels at syntax boundaries, never rewrite argument data.
+_VENDOR = r"(?:(?:\uff5c{1,2}|\|{1,2})\s*DSML\s*(?:\uff5c{1,2}|\|{1,2})\s*)?"
+_OPEN_RE = re.compile(r"<" + _VENDOR + r"(" + _TAGS_ALT + r")(\s[^>]*?)?\s*/?>", re.IGNORECASE)
 _ATTR_RE = re.compile(r"([A-Za-z_:][-\w:.]*)\s*=\s*(\"([^\"]*)\"|'([^']*)')")
 _ARG_RE = re.compile(
-    r"<(arg|parameter|param)(\s[^>]*?)?\s*>(.*?)</\1\s*>", re.IGNORECASE | re.DOTALL
+    r"<" + _VENDOR + r"(arg|parameter|param)(\s[^>]*?)?\s*>(.*?)</" + _VENDOR + r"\1\s*>", re.IGNORECASE | re.DOTALL
 )
 _RESULT_BLOCK_RE = re.compile(
     r"<tool_result\b[^>]*>.*?</tool_result\s*>", re.IGNORECASE | re.DOTALL
@@ -390,7 +396,7 @@ _DSML_RE = re.compile(
 )
 # Plural wrapper around one or more <invoke> blocks - carries no data itself.
 _WRAPPER_RE = re.compile(
-    r"</?(?:tool_calls|tool-calls|toolcalls|function_calls|antml:function_calls)\s*>",
+    r"</?" + _VENDOR + r"(?:tool_calls|tool-calls|toolcalls|function_calls|antml:function_calls)\s*>",
     re.IGNORECASE,
 )
 
@@ -411,6 +417,7 @@ def normalize_dialects(text: str) -> str:
 STREAM_SENTINELS = (
     ["<" + t for t in OPEN_TAG_NAMES]
     + ["</" + t for t in OPEN_TAG_NAMES]
+    + ["<tool_result", "<tool_calls", "</tool_calls", "<tool-calls", "</tool-calls", "<function_calls", "</function_calls", "<antml:function_calls", "</antml:function_calls"]
     + [
         "<tool_result",
         "<tool_calls",
@@ -437,24 +444,33 @@ def _parse_attrs(raw: Optional[str]) -> Dict[str, str]:
 
 
 def _find_close(text: str, tag: str, start: int) -> Tuple[int, int]:
-    """Locate the close tag for `tag` at/after `start`.
-
-    Skips close tags that fall inside an unbalanced raw <arg> block, so that raw
-    argument content containing a literal '</tool_call>' does not truncate the call.
-    Returns (close_start, close_end) or (-1, -1).
-    """
-    close_re = re.compile(r"</\s*" + re.escape(tag) + r"\s*>", re.IGNORECASE)
-    pos = start
-    while True:
-        m = close_re.search(text, pos)
-        if not m:
-            return -1, -1
-        segment = text[start : m.start()]
-        opens = len(re.findall(r"<(?:arg|parameter|param)\b", segment, re.IGNORECASE))
-        closes = len(re.findall(r"</(?:arg|parameter|param)\s*>", segment, re.IGNORECASE))
-        if opens <= closes:
-            return m.start(), m.end()
-        pos = m.end()
+    """Find syntax, not a closing tag embedded in JSON or raw argument data."""
+    close_re = re.compile(r"</\s*" + _VENDOR + re.escape(tag) + r"\s*>", re.IGNORECASE)
+    body = strip_fences(text[start:]).lstrip()
+    is_json = body.startswith(("{", "["))
+    for match in close_re.finditer(text, start):
+        segment = text[start:match.start()]
+        if is_json:
+            quote = ""
+            escaped = False
+            for ch in segment:
+                if escaped:
+                    escaped = False
+                elif quote and ch == "\\":
+                    escaped = True
+                elif quote and ch == quote:
+                    quote = ""
+                elif not quote and ch in ("\"", "'"):
+                    quote = ch
+            if quote:
+                continue
+        else:
+            opens = len(re.findall(r"<" + _VENDOR + r"(?:arg|parameter|param)\b", segment, re.IGNORECASE))
+            closes = len(re.findall(r"</" + _VENDOR + r"(?:arg|parameter|param)\s*>", segment, re.IGNORECASE))
+            if opens > closes:
+                continue
+        return match.start(), match.end()
+    return -1, -1
 
 
 def _coerce_scalar(value: str, ptype: Any) -> Any:
@@ -520,52 +536,110 @@ def coerce_args(args: Dict[str, Any], schema: Optional[Dict[str, Any]]) -> Dict[
 
 
 def validate_args(args: Dict[str, Any], schema: Optional[Dict[str, Any]]) -> List[str]:
-    """Shallow JSON-schema validation. Returns human-readable problems."""
-    problems: List[str] = []
-    if not isinstance(schema, dict):
-        return problems
-    required = schema.get("required")
-    if isinstance(required, list):
-        for req in required:
-            if req not in args:
-                problems.append("missing required parameter %r" % req)
-    props = schema.get("properties")
-    if isinstance(props, dict):
-        checks = {
-            "string": str,
-            "number": (int, float),
-            "integer": int,
-            "boolean": bool,
-            "array": list,
-            "object": dict,
+    """Validate the common JSON Schema subset, recursively, without dependencies.
+
+    Supports local $ref, combinators, types, required/properties/items, enum/const,
+    additionalProperties, and common bounds. Unsupported keywords are ignored;
+    this is not a replacement for a complete JSON Schema implementation.
+    """
+    root = schema if isinstance(schema, dict) else {}
+
+    def check(value: Any, spec: Any, path: str, depth: int) -> List[str]:
+        if depth > 32:
+            return [path + " exceeds schema validation depth"]
+        if spec is False:
+            return [path + " is not allowed"]
+        if not isinstance(spec, dict):
+            return []
+        errors: List[str] = []
+        ref = spec.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#/"):
+            target: Any = root
+            for part in ref[2:].split("/"):
+                target = target.get(part.replace("~1", "/").replace("~0", "~")) if isinstance(target, dict) else None
+            if target is not None:
+                errors.extend(check(value, target, path, depth + 1))
+        for keyword in ("allOf", "anyOf", "oneOf"):
+            options = spec.get(keyword)
+            if isinstance(options, list) and options:
+                matches = sum(not check(value, opt, path, depth + 1) for opt in options)
+                if ((keyword == "allOf" and matches != len(options)) or
+                    (keyword == "anyOf" and matches == 0) or
+                    (keyword == "oneOf" and matches != 1)):
+                    errors.append(path + " does not satisfy " + keyword)
+        if "not" in spec and not check(value, spec["not"], path, depth + 1):
+            errors.append(path + " matches a forbidden schema")
+        ptype = spec.get("type")
+        types = ptype if isinstance(ptype, list) else ([ptype] if ptype else [])
+        predicates = {
+            "null": value is None,
+            "boolean": isinstance(value, bool),
+            "string": isinstance(value, str),
+            "number": isinstance(value, (int, float)) and not isinstance(value, bool) and (not isinstance(value, float) or math.isfinite(value)),
+            "integer": isinstance(value, (int, float)) and not isinstance(value, bool) and (not isinstance(value, float) or math.isfinite(value)) and int(value) == value,
+            "array": isinstance(value, list),
+            "object": isinstance(value, dict),
         }
-        for key, val in args.items():
-            pschema = props.get(key)
-            if not isinstance(pschema, dict):
-                continue
-            ptype = pschema.get("type")
-            types = ptype if isinstance(ptype, list) else ([ptype] if ptype else [])
-            types = [str(t).lower() for t in types]
-            if types and "null" not in types and val is None:
-                problems.append("parameter %r must not be null" % key)
-                continue
-            if val is None:
-                continue
-            expected = tuple(
-                c
-                for t in types
-                for c in (checks[t] if isinstance(checks.get(t), tuple) else (checks.get(t),))
-                if c
-            )
-            if expected:
-                if isinstance(val, bool) and bool not in expected:
-                    problems.append("parameter %r must be %s" % (key, "|".join(types)))
-                elif not isinstance(val, expected):
-                    problems.append("parameter %r must be %s" % (key, "|".join(types)))
-            enum = pschema.get("enum")
-            if isinstance(enum, list) and enum and val not in enum:
-                problems.append("parameter %r must be one of %s" % (key, json.dumps(enum)[:200]))
-    return problems
+        if types and not any(predicates.get(t, True) for t in types):
+            return errors + [path + " must be " + "|".join(map(str, types))]
+        def same(a: Any, b: Any) -> bool:
+            if isinstance(a, bool) != isinstance(b, bool):
+                return False
+            return a == b
+        if isinstance(spec.get("enum"), list) and not any(same(value, v) for v in spec["enum"]):
+            errors.append(path + " is not one of the allowed values")
+        if "const" in spec and not same(value, spec["const"]):
+            errors.append(path + " does not match const")
+        if isinstance(value, dict):
+            required = spec.get("required", [])
+            if isinstance(required, list):
+                errors.extend(path + " missing required parameter %r" % k for k in required if isinstance(k, str) and k not in value)
+            props = spec.get("properties", {})
+            props = props if isinstance(props, dict) else {}
+            patterns = spec.get("patternProperties", {})
+            patterns = patterns if isinstance(patterns, dict) else {}
+            for key, item in value.items():
+                matched = key in props
+                if matched:
+                    errors.extend(check(item, props[key], path + "." + key, depth + 1))
+                for pattern, sub in patterns.items():
+                    try:
+                        if re.search(pattern, key):
+                            matched = True
+                            errors.extend(check(item, sub, path + "." + key, depth + 1))
+                    except re.error:
+                        pass
+                if not matched:
+                    errors.extend(check(item, spec.get("additionalProperties", True), path + "." + key, depth + 1))
+        if isinstance(value, list):
+            for i, item in enumerate(value):
+                errors.extend(check(item, spec.get("items", {}), "%s[%d]" % (path, i), depth + 1))
+            for keyword, fails in (("minItems", lambda n: len(value) < n), ("maxItems", lambda n: len(value) > n)):
+                if isinstance(spec.get(keyword), (int, float)) and fails(spec[keyword]):
+                    errors.append(path + " violates " + keyword)
+            if spec.get("uniqueItems") and len({canon_json(v) for v in value}) != len(value):
+                errors.append(path + " must contain unique items")
+        if isinstance(value, str):
+            for keyword, fails in (("minLength", lambda n: len(value) < n), ("maxLength", lambda n: len(value) > n)):
+                if isinstance(spec.get(keyword), (int, float)) and fails(spec[keyword]):
+                    errors.append(path + " violates " + keyword)
+            if isinstance(spec.get("pattern"), str):
+                try:
+                    if not re.search(spec["pattern"], value):
+                        errors.append(path + " does not match pattern")
+                except re.error:
+                    pass
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            for keyword, fails in (("minimum", lambda n: value < n), ("maximum", lambda n: value > n),
+                                   ("exclusiveMinimum", lambda n: value <= n), ("exclusiveMaximum", lambda n: value >= n)):
+                bound = spec.get(keyword)
+                if isinstance(bound, (int, float)) and not isinstance(bound, bool) and fails(bound):
+                    errors.append(path + " violates " + keyword)
+        return errors[:20]
+
+    if not isinstance(args, dict):
+        return ["arguments must be an object"]
+    return check(args, root, "arguments", 0)
 
 
 def _build_call(
@@ -606,7 +680,7 @@ def parse_call_body(
     name = attrs.get("name") or attrs.get("tool") or attrs.get("function") or ""
 
     # Raw <arg name="...">...</arg> form.
-    arg_matches = list(_ARG_RE.finditer(body))
+    arg_matches = [] if body.lstrip().startswith(("{", "[")) else list(_ARG_RE.finditer(body))
     if arg_matches:
         args: Dict[str, Any] = {}
         for m in arg_matches:
@@ -677,7 +751,7 @@ def parse_call_body(
         if final_name:
             return _build_call(final_name, pargs, raw, repaired, tools_by_name)
 
-    if name:
+    if name and not body.strip():
         return _build_call(name, {}, raw, True, tools_by_name)
     return None
 
@@ -701,7 +775,17 @@ def extract_tool_calls(
     """Split model output into (visible text, tool calls)."""
     if not text:
         return "", []
-    text = normalize_dialects(text)
+    # A bare call must be recognized before scanning its JSON string values.
+    candidate = strip_fences(text)
+    if salvage and candidate.startswith("{") and len(candidate) < 20000:
+        parsed, _ = loads_tolerant(candidate)
+        if isinstance(parsed, dict):
+            nm = next((parsed[k] for k in ("name", "tool", "tool_name", "function_name")
+                       if isinstance(parsed.get(k), str)), "")
+            if nm in tools_by_name and any(k in parsed for k in ("arguments", "input", "parameters", "args")):
+                call = parse_call_body(candidate, {}, tools_by_name)
+                if call:
+                    return "", [call]
 
     calls: List[ToolCall] = []
     out_parts: List[str] = []
@@ -709,6 +793,11 @@ def extract_tool_calls(
 
     while True:
         m = _OPEN_RE.search(text, pos)
+        result = re.search(r"<" + _VENDOR + r"tool_result\b[^>]*>", text[pos:], re.IGNORECASE)
+        if result and (not m or pos + result.start() < m.start()):
+            # Everything after a fabricated result depends on a tool that never ran.
+            out_parts.append(text[pos:pos + result.start()])
+            break
         if not m:
             out_parts.append(text[pos:])
             break
@@ -739,7 +828,7 @@ def extract_tool_calls(
             calls.append(call)
         pos = c_end
 
-    visible = "".join(out_parts)
+    visible = _WRAPPER_RE.sub("", "".join(out_parts))
     visible = strip_hallucinated_results(visible)
     if calls:
         visible = _clean_trailing_fence(visible)
@@ -790,6 +879,7 @@ class StreamToolParser:
         self.calls: List[ToolCall] = []
         self.text_emitted = ""
         self.saw_any_call = False
+        self.discard_rest = False
 
     @staticmethod
     def _holdback_len(buf: str) -> int:
@@ -814,13 +904,14 @@ class StreamToolParser:
 
     def feed(self, delta: str) -> List[str]:
         """Consume a chunk; return visible text pieces to forward to the client."""
-        if not delta:
+        if not delta or self.discard_rest:
             return []
         out: List[str] = []
         self.buf += delta
-        # Applied to the whole buffer every chunk: idempotent, and a split vendor
-        # sentinel is still held back by _holdback_len until it completes.
-        self.buf = normalize_dialects(self.buf)
+        # Do not leak a bare JSON call as text before salvaging it at EOF.
+        if (self.salvage and not self.text_emitted and not self.calls and not self.in_call
+                and strip_fences(self.buf).lstrip().startswith("{") and len(self.buf) < 20000):
+            return []
 
         while True:
             if self.in_call:
@@ -839,8 +930,17 @@ class StreamToolParser:
                 continue
 
             m = _OPEN_RE.search(self.buf)
+            result = re.search(r"<" + _VENDOR + r"tool_result\b[^>]*>", self.buf, re.IGNORECASE)
+            if result and (not m or result.start() < m.start()):
+                head = _WRAPPER_RE.sub("", self.buf[:result.start()])
+                if head:
+                    out.append(head)
+                    self.text_emitted += head
+                self.buf = ""
+                self.discard_rest = True
+                break
             if m:
-                head = self.buf[: m.start()]
+                head = _WRAPPER_RE.sub("", self.buf[: m.start()])
                 if self.saw_any_call is False and not self.calls:
                     head = _clean_trailing_fence(head)
                 head = strip_hallucinated_results(head)
@@ -864,7 +964,7 @@ class StreamToolParser:
             emit = self.buf[: len(self.buf) - hold] if hold else self.buf
             self.buf = self.buf[len(self.buf) - hold :] if hold else ""
             if emit:
-                emit = strip_hallucinated_results(emit)
+                emit = strip_hallucinated_results(_WRAPPER_RE.sub("", emit))
                 if emit:
                     out.append(emit)
                     self.text_emitted += emit
@@ -884,7 +984,16 @@ class StreamToolParser:
             self.buf = ""
             self.in_call = False
         elif self.buf:
-            tail = strip_hallucinated_results(self.buf)
+            if self.salvage and not self.text_emitted and not self.calls:
+                visible, salvaged = extract_tool_calls(self.buf, self.tools_by_name, salvage=True)
+                if salvaged:
+                    self.calls.extend(salvaged)
+                    self.buf = ""
+                    if visible:
+                        out.append(visible)
+                        self.text_emitted += visible
+                    return out, self.calls
+            tail = strip_hallucinated_results(_WRAPPER_RE.sub("", self.buf))
             if self.calls:
                 tail = _clean_trailing_fence(tail)
             if tail.strip():
@@ -926,6 +1035,7 @@ __all__ = [
     "OPEN_TAG_NAMES",
     "_TAGS_ALT",
     "_OPEN_RE",
+    "_VENDOR",
     "_ATTR_RE",
     "_ARG_RE",
     "_RESULT_BLOCK_RE",

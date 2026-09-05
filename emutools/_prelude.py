@@ -5,6 +5,9 @@
 from __future__ import annotations
 
 import argparse
+import codecs
+import math
+import http.client
 import hashlib
 import json
 import os
@@ -28,6 +31,9 @@ __version__ = "1.0.0"
 __all__ = [
     "annotations",
     "argparse",
+    "codecs",
+    "math",
+    "http",
     "hashlib",
     "json",
     "os",
