@@ -1,7 +1,8 @@
-"""Test-only upstream meter with conservative V4 Pro peak cache-miss rates.
+"""Test-only upstream meter with conservative V4 Pro peak rates.
 
 Paid runs reserve worst-case output plus an input byte-count upper estimate.
-Missing usage is charged at the reservation. Private diagnostics omit headers
+Verified cache hits use the peak cache-hit rate; unknown/inconsistent cache
+metrics get no discount. Missing usage is charged at the reservation. Private diagnostics omit headers
 and reasoning traces; never publish raw request/response files automatically.
 """
 import http.server
@@ -12,6 +13,18 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+
+def usage_upper_bound(usage,reservation):
+    """Peak prices: input miss $1.32/M, verified hit $0.044/M, output $3.96/M."""
+    if not isinstance(usage,dict):return reservation
+    prompt=usage.get('prompt_tokens');output=usage.get('completion_tokens')
+    if any(type(n) is not int or n<0 for n in (prompt,output)):return reservation
+    hit=usage.get('prompt_cache_hit_tokens',0)
+    if type(hit) is not int or not 0<=hit<=prompt:hit=0
+    miss=usage.get('prompt_cache_miss_tokens')
+    if miss is not None and (type(miss) is not int or miss<0 or miss+hit!=prompt):hit=0
+    return ((prompt-hit)*1.32+hit*.044+output*3.96)/1000000
 
 
 class BudgetBridge:
@@ -83,9 +96,7 @@ class BudgetBridge:
                         try:self.error(502,'Test upstream connection failed')
                         except OSError:pass
                 finally:
-                    if usage and isinstance(usage.get('prompt_tokens'),int) and isinstance(usage.get('completion_tokens'),int):
-                        charge=(usage['prompt_tokens']*1.32+usage['completion_tokens']*3.96)/1000000
-                    else:charge=estimate
+                    charge=usage_upper_bound(usage,estimate)
                     diagnostic={'content':''.join(content),'native_fragments':native,'delta_keys':sorted(delta_keys),'finish_reasons':finish_reasons}
                     (outer.log.parent/('response-%02d.json'%index)).write_text(json.dumps(diagnostic,ensure_ascii=False))
                     event={'request':index,'status':status,'input_bytes':len(raw),'max_output_tokens':maximum,
@@ -97,7 +108,7 @@ class BudgetBridge:
                         with outer.log.open('a') as out:out.write(json.dumps(event)+'\n')
         self.server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler)
         self.server.daemon_threads=True
-        self.thread=threading.Thread(target=self.server.serve_forever,daemon=True)
+        self.thread=threading.Thread(target=self.server.server.serve_forever,daemon=True)
     def start(self):
         self.thread.start();return 'http://127.0.0.1:%d'%self.server.server_address[1]
     def stop(self):
