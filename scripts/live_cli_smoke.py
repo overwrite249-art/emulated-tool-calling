@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Opt-in live test: real CLI -> emutools -> DeepSeek V4 Pro.
 
-Requires EMU_UPSTREAM_API_KEY and an installed Claude Code or OpenCode binary.
+Requires an installed Claude Code or OpenCode binary. Live mode also requires
+EMU_UPSTREAM_API_KEY; --mock-upstream uses a deterministic local model in CI.
 Never run this in a valuable working directory: it creates its own fixture.
 The API key is passed only to the proxy, never to the CLI or fixture MCP server.
 """
@@ -13,7 +14,6 @@ import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.request
 
@@ -34,7 +34,7 @@ for line in sys.stdin:
             p=msg.get("params",{})
             a=p.get("arguments",{})
             value=a["a"]+a["b"]
-            with open("mcp-events.jsonl","a") as log:log.write(json.dumps({"tool":p["name"],"arguments":a,"result":value})+"\n")
+            with Path(__file__).with_name("mcp-events.jsonl").open("a") as log:log.write(json.dumps({"tool":p["name"],"arguments":a,"result":value})+"\n")
             result={"content":[{"type":"text","text":str(value)}],"isError":False}
         elif method=="ping":result={}
         else:
@@ -62,9 +62,10 @@ def main():
     ap.add_argument("--cli", required=True)
     ap.add_argument("--out-dir", required=True, help="new, disposable directory for fixture and logs")
     ap.add_argument("--timeout", type=int, default=180)
+    ap.add_argument("--mock-upstream", action="store_true", help="no paid model; actual CLI/tools still run")
     args = ap.parse_args()
     root = Path(__file__).resolve().parents[1]
-    key = os.environ.get("EMU_UPSTREAM_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")
+    key = "mock" if args.mock_upstream else os.environ.get("EMU_UPSTREAM_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")
     if not key:
         ap.error("set EMU_UPSTREAM_API_KEY; the test makes paid API requests")
     work = Path(args.out_dir).resolve()
@@ -122,9 +123,16 @@ def main():
         (fixture / "opencode.json").write_text(json.dumps(config), encoding="utf-8")
         client_env.update(OPENCODE_DISABLE_AUTOUPDATE="true", OPENCODE_DISABLE_MODELS_FETCH="true")
         command = [args.cli, "run", "--model", "emutools/deepseek-v4-pro", "--format", "json", prompt]
+    mock = None
+    if args.mock_upstream:
+        sys.path.insert(0, str(root))
+        from cli_mock_upstream import CLIMockUpstream
+        mock = CLIMockUpstream(fixture)
+        mock_port = mock.start()
+        proxy_env["EMU_UPSTREAM_BASE_URL"] = "http://127.0.0.1:%d" % mock_port
     proxy = client = None
     started = time.monotonic()
-    result = {"client": args.client, "upstream_model": "deepseek-v4-pro"}
+    result = {"client": args.client, "upstream_model": "deterministic mock" if args.mock_upstream else "deepseek-v4-pro"}
     try:
         with (work / "proxy.log").open("w") as proxy_log:
             proxy = subprocess.Popen([sys.executable, "-m", "emutools"], cwd=root, env=proxy_env,
@@ -158,12 +166,23 @@ def main():
             result["mcp_calls"] = mcp_calls
             result["mcp_passed"] = any(x == {"tool": "sum", "arguments": {"a": 17, "b": 25}, "result": 42} for x in mcp_calls)
             transcript = (work / "client.jsonl").read_text()
-            result["client_reported_success"] = "CLI_SMOKE_OK" in transcript
+            records = []
+            for line in transcript.splitlines():
+                try:
+                    records.append(json.loads(line))
+                except ValueError:
+                    pass
+            result["client_reported_success"] = any(
+                (r.get("type") == "result" and not r.get("is_error") and "CLI_SMOKE_OK" in r.get("result", "")) or
+                (r.get("type") == "text" and "CLI_SMOKE_OK" in r.get("part", {}).get("text", "")) for r in records)
+            result["client_ran_fixture_test"] = "FIXTURE_TEST_PASS" in transcript
             result["passed"] = (result["exit_code"] == 0 and result["fixture_test_passed"]
-                                and result["mcp_passed"] and result["client_reported_success"])
+                                and result["mcp_passed"] and result["client_reported_success"] and result["client_ran_fixture_test"])
     finally:
         stop(client)
         stop(proxy)
+        if mock:
+            mock.stop()
         result["elapsed_seconds"] = round(time.monotonic() - started, 2)
         (work / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps(result, ensure_ascii=False, indent=2))
