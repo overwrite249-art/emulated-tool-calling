@@ -8,10 +8,101 @@ from .engine import *  # noqa: F401,F403
 # --- end generated header ---
 
 
+class RequestError(ValueError):
+    def __init__(self, message: str, status: int = 400) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def validate_request(body: Dict[str, Any], protocol: str) -> None:
+    """Reject malformed client values before conversion or starting a 200 stream."""
+    for name in ("max_tokens", "max_completion_tokens"):
+        if name in body and (isinstance(body[name], bool) or not isinstance(body[name], int) or body[name] <= 0):
+            raise RequestError(name + " must be a positive integer")
+    for name in ("stream", "parallel_tool_calls"):
+        if name in body and not isinstance(body[name], bool):
+            raise RequestError(name + " must be a boolean")
+    for name, upper in (("temperature", 2), ("top_p", 1)):
+        value = body.get(name)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= upper):
+            raise RequestError("%s must be a number between 0 and %s" % (name, upper))
+    if "model" in body and (not isinstance(body["model"], str) or not body["model"].strip()):
+        raise RequestError("model must be a nonempty string")
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise RequestError("messages must be a nonempty array")
+    roles = ("user", "assistant") if protocol == "anthropic" else ("system", "developer", "user", "assistant", "tool", "function")
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") not in roles:
+            raise RequestError("each message must be an object with a valid role")
+        if message.get("content") is not None and not isinstance(message["content"], (str, list)):
+            raise RequestError("message content must be a string, array, or null")
+        if "tool_calls" in message and not isinstance(message["tool_calls"], list):
+            raise RequestError("message tool_calls must be an array")
+    tool_names: List[str] = []
+    for field_name in ("tools", "functions"):
+        if field_name not in body:
+            continue
+        if not isinstance(body[field_name], list):
+            raise RequestError(field_name + " must be an array")
+        for raw in body[field_name]:
+            if not isinstance(raw, dict):
+                raise RequestError("each tool must be an object")
+            tool = raw.get("function", raw)
+            if not isinstance(tool, dict) or not isinstance(tool.get("name"), str) or not tool["name"].strip():
+                raise RequestError("each tool must have a nonempty name")
+            for schema_key in ("parameters", "input_schema"):
+                if schema_key in tool and not isinstance(tool[schema_key], dict):
+                    raise RequestError("tool " + schema_key + " must be an object")
+            if tool["name"] in tool_names:
+                raise RequestError("tool names must be unique")
+            tool_names.append(tool["name"])
+    choice = body.get("tool_choice")
+    forced = None
+    required = False
+    if isinstance(choice, dict):
+        kind = choice.get("type")
+        allowed = ("auto", "none", "any", "tool") if protocol == "anthropic" else ("function", "none", "any", "required")
+        if kind not in allowed:
+            raise RequestError("unsupported tool_choice type")
+        if "disable_parallel_tool_use" in choice and not isinstance(choice["disable_parallel_tool_use"], bool):
+            raise RequestError("disable_parallel_tool_use must be a boolean")
+        if kind == "tool":
+            forced = choice.get("name")
+        elif kind == "function":
+            fn = choice.get("function")
+            forced = fn.get("name") if isinstance(fn, dict) else None
+        if kind in ("tool", "function") and (not isinstance(forced, str) or forced not in tool_names):
+            raise RequestError("tool_choice must name an available tool")
+        required = kind in ("any", "required")
+    elif choice is not None:
+        if choice not in ("auto", "none", "required", "any"):
+            raise RequestError("unsupported tool_choice")
+        required = choice in ("required", "any")
+    if required and not tool_names:
+        raise RequestError("tool_choice requires at least one tool")
+    opts = body.get("stream_options")
+    if opts is not None and (not isinstance(opts, dict) or ("include_usage" in opts and not isinstance(opts["include_usage"], bool))):
+        raise RequestError("stream_options.include_usage must be a boolean")
+    for name in ("stop", "stop_sequences"):
+        if name in body and body[name] is not None:
+            stops = [body[name]] if isinstance(body[name], str) and name == "stop" else body[name]
+            if not isinstance(stops, list) or any(not isinstance(x, str) or not x for x in stops):
+                raise RequestError(name + " must contain nonempty strings")
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "emutools/" + __version__
     sys_version = ""
+
+    @property
+    def cfg(self) -> Config:
+        return self.server.cfg
+
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(self.cfg.client_timeout)
 
     # ---------- low-level helpers ----------
 
@@ -70,41 +161,64 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def _read_body(self) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-        try:
-            length = int(self.headers.get("content-length") or 0)
-        except (TypeError, ValueError):
-            length = 0
-        if length <= 0:
-            if (self.headers.get("transfer-encoding") or "").lower() == "chunked":
-                buf = b""
-                while True:
-                    line = self.rfile.readline().strip()
-                    if not line:
-                        break
-                    try:
-                        size = int(line, 16)
-                    except ValueError:
-                        break
-                    if size == 0:
-                        self.rfile.readline()
-                        break
-                    buf += self.rfile.read(size)
-                    self.rfile.readline()
-                raw = buf
-            else:
-                return {}, None
+    def _read_body(self) -> Dict[str, Any]:
+        lengths = self.headers.get_all("content-length", [])
+        encodings = self.headers.get_all("transfer-encoding", [])
+        if len(lengths) > 1 or (lengths and encodings):
+            raise RequestError("ambiguous request body framing")
+        limit = max(1, self.cfg.max_request_bytes)
+        if encodings:
+            if len(encodings) != 1 or encodings[0].strip().lower() != "chunked":
+                raise RequestError("only chunked transfer encoding is supported")
+            chunks: List[bytes] = []
+            total = 0
+            while True:
+                line = self.rfile.readline(8193)
+                if len(line) > 8192 or not line.endswith(b"\r\n"):
+                    raise RequestError("invalid chunk header")
+                size_text = line[:-2].split(b";", 1)[0]
+                if not re.fullmatch(b"[0-9a-fA-F]+", size_text):
+                    raise RequestError("invalid chunk size")
+                size = int(size_text, 16)
+                if size == 0:
+                    trailer_size = 0
+                    while True:
+                        trailer = self.rfile.readline(8193)
+                        trailer_size += len(trailer)
+                        if len(trailer) > 8192 or trailer_size > 65536 or not trailer.endswith(b"\r\n"):
+                            raise RequestError("invalid or oversized chunk trailers")
+                        if trailer == b"\r\n":
+                            break
+                        if b":" not in trailer:
+                            raise RequestError("invalid chunk trailer")
+                    break
+                total += size
+                if total > limit:
+                    raise RequestError("request body too large", 413)
+                chunk = self.rfile.read(size)
+                if len(chunk) != size or self.rfile.read(2) != b"\r\n":
+                    raise RequestError("truncated or invalid chunk data")
+                chunks.append(chunk)
+            raw = b"".join(chunks)
         else:
-            if length > 200 * 1024 * 1024:
-                return None, "request body too large"
+            value = lengths[0] if lengths else "0"
+            if not re.fullmatch(r"[0-9]+", value):
+                raise RequestError("invalid content-length")
+            length = int(value)
+            if length > limit:
+                raise RequestError("request body too large", 413)
             raw = self.rfile.read(length)
+            if len(raw) != length:
+                raise RequestError("truncated request body")
         try:
-            data = json.loads(raw.decode("utf-8", "replace") or "{}")
-        except ValueError as exc:
-            return None, "invalid JSON body: %s" % exc
+            def reject_constant(value: str) -> None:
+                raise ValueError("non-finite JSON number")
+            data = json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
+        except (ValueError, UnicodeError) as exc:
+            raise RequestError("invalid JSON body") from exc
         if not isinstance(data, dict):
-            return None, "request body must be a JSON object"
-        return data, None
+            raise RequestError("request body must be a JSON object")
+        return data
 
     def _error(self, protocol: str, status: int, message: str, etype: str = "invalid_request_error") -> None:
         log_warn("HTTP %d %s: %s" % (status, self.path, message))
@@ -138,7 +252,7 @@ class Handler(BaseHTTPRequestHandler):
                             "created": 1700000000,
                             "owned_by": "emutools",
                         }
-                        for m in ADVERTISED_MODELS
+                        for m in dict.fromkeys(ADVERTISED_MODELS + [self.cfg.model_big, self.cfg.model_small])
                     ],
                 },
             )
@@ -149,12 +263,12 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "status": "ok",
                     "version": __version__,
-                    "upstream": CFG.upstream_base,
-                    "model_big": CFG.model_big,
-                    "model_small": CFG.model_small,
-                    "parallel": CFG.parallel,
-                    "max_tool_rounds": CFG.max_tool_rounds,
-                    "max_repeat": CFG.max_repeat,
+                    "upstream": self.cfg.upstream_base,
+                    "model_big": self.cfg.model_big,
+                    "model_small": self.cfg.model_small,
+                    "parallel": self.cfg.parallel,
+                    "max_tool_rounds": self.cfg.max_tool_rounds,
+                    "max_repeat": self.cfg.max_repeat,
                 },
             )
             return
@@ -179,41 +293,44 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
-        protocol = "anthropic" if path.startswith("/v1/messages") else "openai"
-
-        body, err = self._read_body()
-        if err is not None or body is None:
-            self._error(protocol, 400, err or "invalid body")
-            return
-        if CFG.log_bodies:
-            log_debug("REQ %s %s" % (path, truncate_middle(canon_json(body), 4000)))
-
+        protocol = "anthropic" if path.startswith(("/v1/messages", "/messages")) else "openai"
         try:
-            if path == "/v1/messages/count_tokens":
+            body = self._read_body()
+            if self.cfg.log_bodies:
+                log_debug("REQ %s %s" % (path, truncate_middle(canon_json(body), 4000)))
+            if path in ("/v1/messages/count_tokens", "/messages/count_tokens"):
                 self._handle_count_tokens(body)
             elif path in ("/v1/messages", "/messages"):
                 self._handle_messages(body)
-            elif path in ("/v1/chat/completions", "/chat/completions", "/v1/completions"):
+            elif path in ("/v1/chat/completions", "/chat/completions"):
                 self._handle_chat(body)
             else:
                 self._error(protocol, 404, "unknown route %s" % path, "not_found_error")
+        except RequestError as exc:
+            self.close_connection = True  # never reuse unread/ambiguous framing
+            self._error(protocol, exc.status, str(exc))
+        except (socket.timeout, TimeoutError):
+            self.close_connection = True
+            self._error(protocol, 408, "request body timed out")
         except UpstreamError as exc:
             self._error(protocol, 502 if exc.status < 400 else exc.status, exc.message, "api_error")
         except (BrokenPipeError, ConnectionResetError):
             log_info("client disconnected")
         except Exception as exc:  # noqa: BLE001 - never kill the server
             log_error("unhandled error on %s: %s\n%s" % (path, exc, traceback.format_exc()))
-            self._error(protocol, 500, "internal proxy error: %s" % exc, "api_error")
+            self._error(protocol, 500, "internal proxy error", "api_error")
 
     # ---------- handlers ----------
 
     def _handle_count_tokens(self, body: Dict[str, Any]) -> None:
-        req = anthropic_to_canon(body, CFG)
-        payload = build_upstream_payload(req, CFG, [], allow_tools=True)
+        validate_request(body, "anthropic")
+        req = anthropic_to_canon(body, self.cfg)
+        payload = build_upstream_payload(req, self.cfg, [], allow_tools=True)
         self._send_json(200, {"input_tokens": _estimate_input_tokens(payload)})
 
     def _handle_messages(self, body: Dict[str, Any]) -> None:
-        req = anthropic_to_canon(body, CFG)
+        validate_request(body, "anthropic")
+        req = anthropic_to_canon(body, self.cfg)
         if not req.messages:
             self._error("anthropic", 400, "messages must not be empty")
             return
@@ -222,7 +339,7 @@ class Handler(BaseHTTPRequestHandler):
             % (
                 "stream" if req.stream else "sync",
                 req.model or "?",
-                CFG.resolve_model(req.model),
+                self.cfg.resolve_model(req.model),
                 len(req.tools),
                 req.stream,
             )
@@ -230,18 +347,19 @@ class Handler(BaseHTTPRequestHandler):
         if req.stream:
             if not self._start_stream():
                 return
-            for piece in anthropic_stream_bytes(req, CFG):
+            for piece in anthropic_stream_bytes(req, self.cfg):
                 if not self._write_chunk(piece):
                     return
             self._end_chunks()
             return
-        res = run_turn(req, CFG)
+        res = run_turn(req, self.cfg)
         for note in res.notes:
             log_warn("note: " + note)
         self._send_json(200, anthropic_response(req, res))
 
     def _handle_chat(self, body: Dict[str, Any]) -> None:
-        req = openai_to_canon(body, CFG)
+        validate_request(body, "openai")
+        req = openai_to_canon(body, self.cfg)
         if not req.messages:
             self._error("openai", 400, "messages must not be empty")
             return
@@ -252,19 +370,19 @@ class Handler(BaseHTTPRequestHandler):
             % (
                 "stream" if req.stream else "sync",
                 req.model or "?",
-                CFG.resolve_model(req.model),
+                self.cfg.resolve_model(req.model),
                 len(req.tools),
             )
         )
         if req.stream:
             if not self._start_stream():
                 return
-            for piece in openai_stream_bytes(req, CFG, include_usage):
+            for piece in openai_stream_bytes(req, self.cfg, include_usage):
                 if not self._write_chunk(piece):
                     return
             self._end_chunks()
             return
-        res = run_turn(req, CFG)
+        res = run_turn(req, self.cfg)
         for note in res.notes:
             log_warn("note: " + note)
         self._send_json(200, openai_response(req, res))
@@ -274,11 +392,15 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def __init__(self, server_address, RequestHandlerClass=Handler, bind_and_activate=True, cfg=None):
+        self.cfg = cfg if cfg is not None else CFG
+        super().__init__(server_address, RequestHandlerClass, bind_and_activate=bind_and_activate)
+
 
 def serve(cfg: Config) -> None:
     if not cfg.upstream_key:
         log_warn("EMU_UPSTREAM_API_KEY is not set - upstream calls will likely fail with 401")
-    httpd = Server((cfg.host, cfg.port), Handler)
+    httpd = Server((cfg.host, cfg.port), Handler, cfg=cfg)
     log_info("emutools %s listening on http://%s:%d" % (__version__, cfg.host, cfg.port))
     log_info("upstream %s  big=%s  small=%s" % (_upstream_url(cfg), cfg.model_big, cfg.model_small))
     log_info("Claude Code : ANTHROPIC_BASE_URL=http://%s:%d ANTHROPIC_AUTH_TOKEN=dummy claude" % (cfg.host, cfg.port))
@@ -293,6 +415,8 @@ def serve(cfg: Config) -> None:
 
 # --- generated header: build_single_file.py strips these blocks ---
 __all__ = [
+    "RequestError",
+    "validate_request",
     "Handler",
     "Server",
     "serve",
