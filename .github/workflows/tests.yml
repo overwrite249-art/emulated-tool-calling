@@ -127,6 +127,13 @@ jobs:
               }
               if (notes.length) sections.push('Client events: ' + JSON.stringify(notes).slice(-6000));
             }
+            const logDir = path.join(root, 'cli-smoke/home/.local/share/opencode/log');
+            if (fs.existsSync(logDir)) {
+              for (const file of fs.readdirSync(logDir).filter(x => x.endsWith('.log')).slice(-3)) {
+                const errors = fs.readFileSync(path.join(logDir, file), 'utf8').split('\n').filter(x => /error|fatal|panic/i.test(x)).join('\n').slice(-8000);
+                if (errors) sections.push('OpenCode server errors:\n' + errors.replace(/ses_[a-zA-Z0-9]+/g, '<session>'));
+              }
+            }
             const body = sections.join('\n\n');
             const args = {...context.repo, issue_number: context.issue.number};
             const comments = await github.rest.issues.listComments({...args, per_page: 100});
