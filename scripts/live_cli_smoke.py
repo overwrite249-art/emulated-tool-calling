@@ -122,7 +122,7 @@ def main():
         }
         (fixture / "opencode.json").write_text(json.dumps(config), encoding="utf-8")
         client_env.update(OPENCODE_DISABLE_AUTOUPDATE="true", OPENCODE_DISABLE_MODELS_FETCH="true")
-        command = [args.cli, "run", "--model", "emutools/deepseek-v4-pro", "--format", "json", prompt]
+        command = [args.cli, "--print-logs", "--log-level", "ERROR", "run", "--model", "emutools/deepseek-v4-pro", "--format", "json", prompt]
     mock = None
     if args.mock_upstream:
         sys.path.insert(0, str(root))
