@@ -18,6 +18,8 @@ TOOLS = [
     {'name':'db_query','description':'Run a bounded read-only SELECT against the existing SQLite database.',
      'inputSchema':{'type':'object','properties':{'sql':{'type':'string','maxLength':4000}},'required':['sql'],'additionalProperties':False}},
 ]
+for tool in TOOLS:
+    tool['annotations']={'readOnlyHint':True,'destructiveHint':False}
 
 
 def emit(value):
@@ -50,6 +52,7 @@ def query(name,args):
             raise ValueError('Invalid SQL')
         allowed={sqlite3.SQLITE_SELECT,sqlite3.SQLITE_READ,sqlite3.SQLITE_FUNCTION,sqlite3.SQLITE_RECURSIVE}
         def authorize(action,a,b,dbname,source):
+            # SQLite reports a None database for optimized COUNT(*) reads.
             if action not in allowed or (action==sqlite3.SQLITE_READ and dbname not in ('main',None)):
                 return sqlite3.SQLITE_DENY
             if action==sqlite3.SQLITE_FUNCTION and str(b).lower() in ('load_extension','readfile','writefile'):

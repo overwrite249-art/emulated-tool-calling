@@ -1,9 +1,8 @@
-"""Transparent, test-only upstream meter with a conservative USD spend guard.
+"""Test-only upstream meter with conservative V4 Pro peak cache-miss rates.
 
-Uses DeepSeek V4 Pro PEAK cache-miss rates published 2026-09-05 ($1.32/M
-input, $3.96/M output), even off-peak and on cache hits. Each request reserves
-an input byte-count upper estimate plus its maximum output before forwarding.
-Missing usage is charged at the full reservation, not treated as free.
+Paid runs reserve worst-case output plus an input byte-count upper estimate.
+Missing usage is charged at the reservation. Private diagnostics omit headers
+and reasoning traces; never publish raw request/response files automatically.
 """
 import http.server
 import json
@@ -45,7 +44,9 @@ class BudgetBridge:
                     if outer.calls>=outer.max_calls or outer.spent+outer.reserved+estimate>outer.limit:
                         self.error(402,'Conservative challenge spend/request limit reached');return
                     outer.calls+=1;index=outer.calls;outer.reserved+=estimate
+                (outer.log.parent/('request-%02d.json'%index)).write_bytes(raw)
                 started=time.monotonic();usage=None;status=0;stream=bool(body.get('stream'));buffer=b'';connected=True
+                content=[];content_chars=0;native=[];delta_keys=set();finish_reasons=[]
                 try:
                     req=urllib.request.Request(outer.upstream,data=raw,headers={'Content-Type':'application/json','Authorization':'Bearer '+outer.key})
                     try:response=urllib.request.urlopen(req,timeout=180)
@@ -67,6 +68,12 @@ class BudgetBridge:
                                         try:
                                             event=json.loads(line[5:].strip())
                                             if event.get('usage'):usage=event['usage']
+                                            for choice in event.get('choices',[]):
+                                                delta=choice.get('delta',{});delta_keys.update(delta)
+                                                if choice.get('finish_reason'):finish_reasons.append(choice['finish_reason'])
+                                                if isinstance(delta.get('content'),str) and content_chars<64000:
+                                                    content.append(delta['content']);content_chars+=len(delta['content'])
+                                                if delta.get('tool_calls') and len(native)<64:native.append(delta['tool_calls'])
                                         except (ValueError,UnicodeError):pass
                         if not stream:
                             try:usage=json.loads(buffer).get('usage')
@@ -79,8 +86,11 @@ class BudgetBridge:
                     if usage and isinstance(usage.get('prompt_tokens'),int) and isinstance(usage.get('completion_tokens'),int):
                         charge=(usage['prompt_tokens']*1.32+usage['completion_tokens']*3.96)/1000000
                     else:charge=estimate
+                    diagnostic={'content':''.join(content),'native_fragments':native,'delta_keys':sorted(delta_keys),'finish_reasons':finish_reasons}
+                    (outer.log.parent/('response-%02d.json'%index)).write_text(json.dumps(diagnostic,ensure_ascii=False))
                     event={'request':index,'status':status,'input_bytes':len(raw),'max_output_tokens':maximum,
                            'native_tools_sent':False,'thinking':body.get('thinking'),'usage':usage,
+                           'response_chars':content_chars,'delta_keys':sorted(delta_keys),'finish_reasons':finish_reasons,
                            'upper_bound_usd':round(charge,8),'elapsed_seconds':round(time.monotonic()-started,3)}
                     with outer.lock:
                         outer.reserved-=estimate;outer.spent+=charge;outer.events.append(event)

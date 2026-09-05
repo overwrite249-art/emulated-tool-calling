@@ -121,6 +121,43 @@ def run_turn(req: CanonRequest, cfg: Config) -> TurnResult:
 
 
 def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]:
+    """Retry unusable output only before substantive text or a call was delivered.
+
+    A fresh parser is used for each attempt. Usage includes failed attempts, and
+    already-delivered calls are never replayed. Transport failures still surface
+    as errors rather than silently restarting a partially delivered stream.
+    """
+    total_usage: Dict[str, Any] = {}
+    hint = ""
+    max_attempts = 3 if cfg.loop_retry else 1
+    for attempt in range(1, max_attempts + 1):
+        empty = False
+        finish = "stop"
+        for kind, value in _run_turn_stream_attempt(req, cfg, hint):
+            if kind == "usage":
+                for key, number in value.items():
+                    if isinstance(number, (int, float)) and not isinstance(number, bool):
+                        total_usage[key] = total_usage.get(key, 0) + number
+            elif kind == "empty":
+                empty = True
+            elif kind == "finish":
+                finish = value
+            else:
+                yield (kind, value)
+        if not empty:
+            yield ("usage", total_usage)
+            yield ("finish", finish)
+            return
+        if attempt == max_attempts:
+            raise UpstreamError("model returned no usable response after %d attempt(s)" % attempt, 502)
+        log_warn("retrying unusable streamed output (attempt %d/%d)" % (attempt, max_attempts))
+        hint = ("Your previous response contained no usable text or valid tool call. "
+                "Continue the task using ONLY the declared tools and the documented <tool_call> JSON format. "
+                "Never fabricate tool results. Complete every JSON string; split large writes across turns. "
+                "If no tool is needed, give a substantive answer.")
+
+
+def _run_turn_stream_attempt(req: CanonRequest, cfg: Config, recovery_hint: str = "") -> Iterator[Tuple[str, Any]]:
     """Streaming: yields ('text', str) | ('call', ToolCall) | ('usage', dict) | ('finish', str).
 
     Loop protection is applied at the moment a call completes, before it reaches the
@@ -128,6 +165,8 @@ def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]
     """
     st, extra, allow_tools = _prepare(req, cfg)
     tools_by_name = _tools_by_name(req)
+    if recovery_hint:
+        extra = list(extra) + [recovery_hint]
     payload = build_upstream_payload(req, cfg, extra, allow_tools)
 
     parser = StreamToolParser(tools_by_name, cfg.salvage_bare_json)
@@ -188,7 +227,7 @@ def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]
         pieces = parser.feed(chunk)
         for piece in pieces:
             if piece:
-                any_text = True
+                any_text = any_text or bool(piece.strip())
                 yield ("text", piece)
         for tc in parser.calls[before:]:
             for out in consider(tc):
@@ -198,16 +237,16 @@ def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]
     tail_pieces, _all_calls = parser.finish()
     for piece in tail_pieces:
         if piece:
-            any_text = True
+            any_text = any_text or bool(piece.strip())
             yield ("text", piece)
     for tc in parser.calls[before:]:
         for out in consider(tc):
             yield out
 
-    if allow_tools and req.tool_choice not in ("auto", "none") and not emitted_calls:
+    if allow_tools and req.tool_choice not in ("auto", "none") and not emitted_calls and any_text:
         raise UpstreamError("model failed to satisfy tool_choice=%s" % req.tool_choice, 502)
     if not any_text and not emitted_calls:
-        yield ("text", EMPTY_FALLBACK)
+        yield ("empty", True)
 
     if not usage:
         usage = {
@@ -527,6 +566,7 @@ __all__ = [
     "_call_issues",
     "run_turn",
     "run_turn_stream",
+    "_run_turn_stream_attempt",
     "_ANTHROPIC_STOP",
     "_usage_anthropic",
     "anthropic_response",
