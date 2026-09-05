@@ -767,6 +767,16 @@ def _clean_trailing_fence(text: str) -> str:
     return re.sub(r"(?:^|\n)`{3}[a-zA-Z0-9_+-]*[ \t]*\n?\s*$", "\n", text)
 
 
+_NESTED_CLOSE_RE = re.compile(r"</tool_call\s*>", re.IGNORECASE)
+STREAM_SENTINELS.append("</tool_call")
+
+
+def _anonymous_call_wrapper(tag: str, attrs: Dict[str, str], tail: str) -> bool:
+    # A JSON body is an actual call, never a container. Only a child opener
+    # immediately inside an anonymous canonical tag is safe to unwrap.
+    return tag.lower() == "tool_call" and not attrs and bool(_OPEN_RE.match(tail.lstrip()))
+
+
 def extract_tool_calls(
     text: str,
     tools_by_name: Dict[str, ToolDef],
@@ -790,19 +800,33 @@ def extract_tool_calls(
     calls: List[ToolCall] = []
     out_parts: List[str] = []
     pos = 0
+    wrapper_depth = 0
 
     while True:
         m = _OPEN_RE.search(text, pos)
         result = re.search(r"<" + _VENDOR + r"tool_result\b[^>]*>", text[pos:], re.IGNORECASE)
-        if result and (not m or pos + result.start() < m.start()):
+        closing = _NESTED_CLOSE_RE.search(text, pos) if wrapper_depth else None
+        boundary = min(m.start() if m else len(text), closing.start() if closing else len(text))
+        if result and pos + result.start() < boundary:
             # Everything after a fabricated result depends on a tool that never ran.
             out_parts.append(text[pos:pos + result.start()])
             break
+        if closing and (not m or closing.start() < m.start()):
+            out_parts.append(text[pos:closing.start()])
+            pos = closing.end()
+            wrapper_depth -= 1
+            continue
         if not m:
             out_parts.append(text[pos:])
             break
         tag = m.group(1)
         attrs = _parse_attrs(m.group(2))
+        if (wrapper_depth < 16 and not m.group(0).rstrip().endswith("/>")
+                and _anonymous_call_wrapper(tag, attrs, text[m.end():])):
+            out_parts.append(text[pos:m.start()])
+            pos = m.end()
+            wrapper_depth += 1
+            continue
         # Self-closing tag with everything in attributes.
         if m.group(0).rstrip().endswith("/>"):
             out_parts.append(text[pos : m.start()])
@@ -880,6 +904,7 @@ class StreamToolParser:
         self.text_emitted = ""
         self.saw_any_call = False
         self.discard_rest = False
+        self.wrapper_depth = 0
 
     @staticmethod
     def _holdback_len(buf: str) -> int:
@@ -915,6 +940,12 @@ class StreamToolParser:
 
         while True:
             if self.in_call:
+                if (self.wrapper_depth < 16
+                        and _anonymous_call_wrapper(self.call_tag, self.call_attrs, self.buf)):
+                    self.in_call = False
+                    self.call_buf = ""
+                    self.wrapper_depth += 1
+                    continue
                 c_start, c_end = _find_close(self.buf, self.call_tag, 0)
                 if c_start < 0:
                     self.call_buf = self.buf
@@ -931,7 +962,9 @@ class StreamToolParser:
 
             m = _OPEN_RE.search(self.buf)
             result = re.search(r"<" + _VENDOR + r"tool_result\b[^>]*>", self.buf, re.IGNORECASE)
-            if result and (not m or result.start() < m.start()):
+            closing = _NESTED_CLOSE_RE.search(self.buf) if self.wrapper_depth else None
+            boundary = min(m.start() if m else len(self.buf), closing.start() if closing else len(self.buf))
+            if result and result.start() < boundary:
                 head = _WRAPPER_RE.sub("", self.buf[:result.start()])
                 if head:
                     out.append(head)
@@ -939,6 +972,14 @@ class StreamToolParser:
                 self.buf = ""
                 self.discard_rest = True
                 break
+            if closing and (not m or closing.start() < m.start()):
+                head = _WRAPPER_RE.sub("", self.buf[:closing.start()])
+                if head:
+                    out.append(head)
+                    self.text_emitted += head
+                self.buf = self.buf[closing.end():]
+                self.wrapper_depth -= 1
+                continue
             if m:
                 head = _WRAPPER_RE.sub("", self.buf[: m.start()])
                 if self.saw_any_call is False and not self.calls:
