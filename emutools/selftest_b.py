@@ -216,7 +216,7 @@ def _selftest_part2(r: "_Runner") -> int:  # noqa: C901
         r.check("original system preserved", "You are a coding agent." in sysp, sysp[:200])
         r.check("anti-hallucination rule present", "NEVER write a `<tool_result>`" in sysp, "missing")
         r.check("no native tools sent upstream", "tools" not in mock.last_request(), repr(list(mock.last_request())))
-        r.check("stop sequence sent upstream", CALL_CLOSE in (mock.last_request().get("stop") or []), repr(mock.last_request().get("stop")))
+        r.check("stop sequence follows configuration", (CALL_CLOSE in (mock.last_request().get("stop") or [])) == CFG.use_stop, repr(mock.last_request().get("stop")))
 
         # --- Anthropic streaming
         mock.script('Sure.\n<tool_call>{"name":"Bash","arguments":{"command":"ls"}}</tool_call>')

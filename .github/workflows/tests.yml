@@ -1,0 +1,38 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile source
+        run: python -m compileall -q emutools tests scripts
+      - name: Regression and real-socket tests
+        run: python -m unittest discover -s tests -v
+      - name: Built-in 200-check suite
+        run: python -m emutools --selftest
+      - name: Build and test standalone distribution
+        run: |
+          python build_single_file.py "$RUNNER_TEMP/emutools.py"
+          python "$RUNNER_TEMP/emutools.py" --selftest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: emutools-python-${{ matrix.python-version }}
+          path: ${{ runner.temp }}/emutools.py
+          if-no-files-found: error
