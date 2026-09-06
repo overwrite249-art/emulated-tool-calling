@@ -89,7 +89,9 @@ Keep your coding client's tool permissions enabled.
 - Inbound request validation returns 400/413/408 for invalid, oversized or timed-out
   bodies. Chunked requests share the size limit and reject ambiguous/truncated framing.
 - Server instances use their own configuration. Model-map syntax matches the docs.
-- Anthropic streams report input usage; non-streaming repair attempts accumulate usage.
+- Anthropic streams report input usage; streamed and non-streaming repair attempts accumulate usage.
+- Streamed empty, rejected and nested-call responses receive bounded recovery without replaying delivered calls.
+- Optional JSON envelopes preserve arbitrary source strings and apply the same local tool-policy guards.
 
 ## Endpoints
 
@@ -121,6 +123,17 @@ normalizing literal argument content.
 file content mid-string. Opt in with `EMU_USE_STOP=true` only when that trade-off is
 acceptable; the missing close-tag recovery remains available.
 
+### Optional JSON response mode
+
+`EMU_JSON_OUTPUT=true` requests provider JSON-object output instead of the default text-tag
+format. This is still emulation: no native upstream tool definitions are sent. The full
+JSON envelope is buffered before releasing content or calls, so first-content latency is
+higher. A provider can still return empty or malformed content; local validation stays strict.
+
+See [JSON mode and generation controls](docs/json-output.md) for the contract, limitations,
+and `EMU_THINKING` / `EMU_REASONING_EFFORT` settings. JSON mode is opt-in, not a universal
+recommendation for every model or workload.
+
 ## Tool policy and loop protection
 
 Loop state is reconstructed from each request's transcript, not shared between users:
@@ -131,9 +144,10 @@ With `EMU_PARALLEL=false`, at most one call is forwarded. With it enabled, the c
 per-turn cap applies; a client's `parallel_tool_calls=false` or Anthropic
 `disable_parallel_tool_use=true` can still disable parallel calls.
 
-Non-streaming rejected calls can be retried up to three times with corrective instructions
-when `EMU_LOOP_RETRY=true`. Invalid calls remain blocked after the last attempt. Streaming
-calls are validated before emission but are not silently re-run after partial output.
+Empty, malformed or rejected outputs can be retried up to three times with corrective
+instructions when `EMU_LOOP_RETRY=true`. Invalid calls remain blocked after the last attempt.
+Streaming recovery stops once a valid call has been emitted; a delivered call is never
+replayed to fix an invalid peer. Transport failures are not retried by that repair loop.
 An unsatisfied required/named tool choice returns a protocol error.
 
 Schema validation supports common recursive keywords: types, local `#/...` references,
@@ -157,8 +171,11 @@ implemented. Client permissions remain the authority for executing tools.
 | `EMU_MAX_CALLS_PER_TURN` | `4` | Cap when parallel calling is enabled |
 | `EMU_PARALLEL` | `false` | Otherwise enforce one call per turn |
 | `EMU_USE_STOP` | `false` | Opt-in closing-tag stop; can truncate literal code |
-| `EMU_LOOP_RETRY` | `true` | Bounded non-streaming corrective retries |
-| `EMU_SALVAGE` | `true` | Recover bare JSON calls |
+| `EMU_LOOP_RETRY` | `true` | Bounded streamed and non-streaming corrective retries |
+| `EMU_JSON_OUTPUT` | `false` | Opt-in provider JSON-object mode; whole-envelope buffering |
+| `EMU_THINKING` | empty | Explicit `enabled` / `disabled`; empty preserves provider default |
+| `EMU_REASONING_EFFORT` | empty | `low`, `medium`, `high`, `xhigh`, `max`; provider-dependent |
+| `EMU_SALVAGE` | `true` | Recover bare JSON calls; in JSON mode, narrowly recover surplus closing brackets |
 | `EMU_MAX_RESULT_CHARS` | `24000` | Middle-truncate long tool results |
 | `EMU_MAX_REQUEST_BYTES` | `16777216` | 16 MiB limit for length and chunked bodies |
 | `EMU_CLIENT_TIMEOUT` | `30` | Client socket timeout in seconds |
@@ -173,7 +190,7 @@ EMU_MODEL_MAP='my-model=deepseek-v4-pro,tiny=deepseek-v4-flash' \
 ## Tests and single-file deployment
 
 ```bash
-python3 -m unittest discover -s tests -v  # 53 regressions, including real sockets
+python3 -m unittest discover -s tests -v  # 127 regressions, including real sockets
 python3 -m emutools --selftest            # 200 built-in checks and parser fuzzing
 python3 build_single_file.py /tmp/emutools.py
 python3 /tmp/emutools.py --selftest       # same 200 checks, standalone
@@ -210,12 +227,15 @@ limits, including the small VPS's inability to start OpenCode under memory press
 | `emutools/core.py` | Configuration, canonical types, utilities |
 | `emutools/protocol.py` | Prompts, tolerant parsing, incremental tool parser, validation |
 | `emutools/wire.py` | Loop state, upstream HTTP/SSE, request translation |
+| `emutools/structured.py` | Opt-in strict JSON envelopes and consistent tool history |
 | `emutools/engine.py` | Policy enforcement, turns and response serialization |
 | `emutools/server.py` | HTTP framing, routes, request validation |
 | `emutools/selftest_*.py` | 200-check built-in suite |
 | `tests/` | Focused regressions and real-socket tests |
 | `scripts/live_cli_smoke.py` | Opt-in real-model or deterministic-model CLI test |
 | `scripts/cli_mock_upstream.py` | Deterministic model for real-client CI |
+| `benchmarks/fullstack/` | Seeded SQLite/MCP challenge, bounded paid runner, independent acceptance and concurrency checks |
+| `examples/claude-stockroom/` | Model-authored checkpoint; read its provenance and known limitations before use |
 | `build_single_file.py` | Standalone distribution builder |
 
 ## Remaining limitations
