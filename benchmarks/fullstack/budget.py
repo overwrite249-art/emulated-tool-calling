@@ -55,6 +55,10 @@ class BudgetBridge:
                 estimate=((len(raw)+256*len(body.get('messages',[]))+4096)*1.32+maximum*3.96)/1000000
                 with outer.lock:
                     if outer.calls>=outer.max_calls or outer.spent+outer.reserved+estimate>outer.limit:
+                        rejection={'reason':'request_cap' if outer.calls>=outer.max_calls else 'spend_reservation',
+                                   'accepted_requests':outer.calls,'spent_usd':outer.spent,'in_flight_usd':outer.reserved,
+                                   'reservation_usd':estimate,'limit_usd':outer.limit,'time':time.time()}
+                        with (outer.log.parent/'guard-rejections.jsonl').open('a') as out:out.write(json.dumps(rejection)+'\n')
                         self.error(402,'Conservative challenge spend/request limit reached');return
                     outer.calls+=1;index=outer.calls;outer.reserved+=estimate
                 (outer.log.parent/('request-%02d.json'%index)).write_bytes(raw)
@@ -89,7 +93,20 @@ class BudgetBridge:
                                                 if delta.get('tool_calls') and len(native)<64:native.append(delta['tool_calls'])
                                         except (ValueError,UnicodeError):pass
                         if not stream:
-                            try:usage=json.loads(buffer).get('usage')
+                            try:
+                                packet=json.loads(buffer)
+                                if isinstance(packet,dict):
+                                    usage=packet.get('usage')
+                                    for choice in packet.get('choices',[]):
+                                        if not isinstance(choice,dict):continue
+                                        message=choice.get('message')
+                                        if not isinstance(message,dict):continue
+                                        delta_keys.update(message)
+                                        if choice.get('finish_reason'):finish_reasons.append(choice['finish_reason'])
+                                        if isinstance(message.get('content'),str):
+                                            piece=message['content'][:max(0,64000-content_chars)]
+                                            content.append(piece);content_chars+=len(piece)
+                                        if message.get('tool_calls') and len(native)<64:native.append(message['tool_calls'])
                             except (ValueError,UnicodeError):pass
                 except Exception:
                     if not status:
@@ -97,9 +114,9 @@ class BudgetBridge:
                         except OSError:pass
                 finally:
                     charge=usage_upper_bound(usage,estimate)
-                    diagnostic={'content':''.join(content),'native_fragments':native,'delta_keys':sorted(delta_keys),'finish_reasons':finish_reasons}
+                    diagnostic={'stream':stream,'content':''.join(content),'native_fragments':native,'delta_keys':sorted(delta_keys),'finish_reasons':finish_reasons}
                     (outer.log.parent/('response-%02d.json'%index)).write_text(json.dumps(diagnostic,ensure_ascii=False))
-                    event={'request':index,'status':status,'input_bytes':len(raw),'max_output_tokens':maximum,
+                    event={'request':index,'status':status,'stream':stream,'input_bytes':len(raw),'max_output_tokens':maximum,
                            'native_tools_sent':False,'thinking':body.get('thinking'),'usage':usage,
                            'response_chars':content_chars,'delta_keys':sorted(delta_keys),'finish_reasons':finish_reasons,
                            'upper_bound_usd':round(charge,8),'elapsed_seconds':round(time.monotonic()-started,3)}

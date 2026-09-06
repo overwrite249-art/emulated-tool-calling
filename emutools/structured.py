@@ -13,13 +13,22 @@ STRUCTURED_INSTRUCTION = (
     'and "tool_calls" (an array). Example final answer: '
     '{"text":"Finished.","tool_calls":[]}. Example tool invocation: '
     '{"text":"","tool_calls":[{"name":"EXACT_DECLARED_NAME","arguments":{}}]}. '
-    'Each call requires name and arguments matching its schema. Optional string IDs from history are ignored on output. '
+    'Each call requires name and arguments matching its schema. Always write name before arguments. '
+    'Omit IDs in new calls; IDs in history correlate actual results. '
     'Replace the example name and arguments with real declared values. '
     'Never use XML, DSML, markdown fences, or fabricated tool results. '
     'Strings inside arguments are literal data, including source code and markup. '
+    'Messages containing tool_results are actual observations from already executed calls. '
+    'Use those observations to advance the task, not to repeat earlier calls. '
     'Only request independent calls together; wait for real results before dependent work. '
     'For large files use small patches or append chunks across turns. '
 )
+
+
+def _structured_json(value):
+    # Fingerprints remain canonical elsewhere. Prompt examples and history must
+    # keep the tool name before potentially large arguments, not alphabetize it away.
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 def build_structured_payload(req: CanonRequest, cfg: Config, extra: List[str],
@@ -28,12 +37,12 @@ def build_structured_payload(req: CanonRequest, cfg: Config, extra: List[str],
     messages = []
     for message in req.messages:
         if message.role == "assistant":
-            text = canon_json({"text": message.text, "tool_calls": [
-                {"id": call.id, "name": call.name, "arguments": call.args}
+            text = _structured_json({"text": message.text, "tool_calls": [
+                {"name": call.name, "arguments": call.args, "id": call.id}
                 for call in message.tool_calls
             ]})
         elif message.tool_results:
-            text = canon_json({"text": message.text, "tool_results": [
+            text = _structured_json({"text": message.text, "tool_results": [
                 {"id": tid, "name": name, "content": truncate_middle(content, cfg.max_result_chars),
                  "is_error": is_error}
                 for tid, name, content, is_error in message.tool_results
@@ -52,7 +61,7 @@ def build_structured_payload(req: CanonRequest, cfg: Config, extra: List[str],
         for tool in req.tools
     ] if allow_tools else [], "tool_choice": req.tool_choice if allow_tools else "none",
         "max_calls": limit if allow_tools else 0}
-    instruction = STRUCTURED_INSTRUCTION + "Available tool contract: " + canon_json(spec)
+    instruction = "Available tool contract: " + _structured_json(spec) + "\n\n" + STRUCTURED_INSTRUCTION
     payload = build_upstream_payload(effective, cfg, list(extra) + [instruction], False)
     payload["response_format"] = {"type": "json_object"}
     return payload
