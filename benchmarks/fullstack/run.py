@@ -79,6 +79,7 @@ def main():
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--cli',required=True);ap.add_argument('--out-dir',required=True)
     ap.add_argument('--timeout',type=int,default=600);ap.add_argument('--budget-usd',type=float,default=.40)
     ap.add_argument('--resume-app',help='Prior agent-authored app; copies source only, never its database or built assets')
+    ap.add_argument('--thinking',choices=('enabled','disabled'),help='Explicit upstream thinking mode; omitted keeps the provider default')
     a=ap.parse_args();key=os.environ.get('EMU_UPSTREAM_API_KEY') or os.environ.get('DEEPSEEK_API_KEY')
     if not key:ap.error('set EMU_UPSTREAM_API_KEY; this test makes paid requests')
     work=Path(a.out_dir).resolve();work.mkdir(parents=True,exist_ok=False);app=work/'app';app.mkdir();home=work/'home';home.mkdir()
@@ -87,7 +88,7 @@ def main():
     if resumed:
         spec+='\n\n## Continuation for this run\nUnfinished source from an earlier real model run is already present. Inspect it and finish it rather than starting over unnecessarily. The empty-workspace description does not apply to this continuation. All other requirements still apply. Use the current working directory, not paths from an earlier run.\n'
     (app/'REQUIREMENTS.md').write_text(spec)
-    protected={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in HERE.iterdir() if p.is_file()}
+    protected={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in list(HERE.iterdir())+list((REPO/'emutools').glob('*.py')) if p.is_file()}
     env={k:v for k,v in os.environ.items() if k in ('PATH','LANG','LC_ALL','LD_LIBRARY_PATH','TMPDIR','SSL_CERT_FILE','SSL_CERT_DIR')}
     env.update(HOME=str(home),PWD=str(app),XDG_CONFIG_HOME=str(home/'.config'),XDG_DATA_HOME=str(home/'.local/share'),XDG_CACHE_HOME=str(home/'.cache'),DISABLE_TELEMETRY='1',DO_NOT_TRACK='1')
     meter=BudgetBridge(key,work/'upstream.jsonl',limit=a.budget_usd)
@@ -96,6 +97,7 @@ def main():
                    EMU_UPSTREAM_API_KEY=meter.token,EMU_MODEL_BIG='deepseek-v4-pro',EMU_MODEL_SMALL='deepseek-v4-pro',
                    EMU_PARALLEL='true',EMU_MAX_CALLS_PER_TURN='4',EMU_MAX_TOOL_ROUNDS='25',EMU_USE_STOP='false',
                    EMU_MAX_RETRIES='1',EMU_TIMEOUT='180',EMU_LOG_BODIES='false')
+    if a.thinking:proxy_env['EMU_THINKING']=a.thinking
     client_env=dict(env,ANTHROPIC_BASE_URL=base,ANTHROPIC_API_KEY='dummy',ANTHROPIC_AUTH_TOKEN='dummy',
                     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC='1',CLAUDE_CODE_MAX_OUTPUT_TOKENS='6000',MAX_THINKING_TOKENS='0')
     mcp={'mcpServers':{'warehouse':{'command':sys.executable,'args':[str(HERE/'db_mcp.py'),str(app/'data/inventory.sqlite'),str(work/'mcp-events.jsonl')]}}}
@@ -106,7 +108,7 @@ def main():
              '--max-turns','30','--max-budget-usd','2.00','--system-prompt',
              'You are performing a real coding integration test. Implement the app, use the available tools, and verify actual outcomes. Work only in the provided app workspace. Never edit evaluator files or emutools. Keep output concise. Use independent tool calls in batches when safe. Do not install packages or access external services. Do not claim success without passing commands.',
              spec+'\nUse port '+str(app_port)+' for your server. To run the independent verifier: python3 '+str(HERE/'verify.py')+' --app '+str(app)+' --out-dir '+str(app/'acceptance-1')+'. Use a NEW output directory (acceptance-2 etc.) on each repeat. Fix failures before finishing.']
-    proxy=client=None;start=time.monotonic();result={'model':'deepseek-v4-pro','parallel_enabled':True,'max_calls_per_turn':4,'resumed_source_files':resumed}
+    proxy=client=None;start=time.monotonic();result={'model':'deepseek-v4-pro','parallel_enabled':True,'max_calls_per_turn':4,'resumed_source_files':resumed,'thinking_mode':a.thinking or 'provider_default'}
     try:
         with (work/'proxy.log').open('w') as log:
             proxy=subprocess.Popen([sys.executable,'-m','emutools'],cwd=REPO,env=proxy_env,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)

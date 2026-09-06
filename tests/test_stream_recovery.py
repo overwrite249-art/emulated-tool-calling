@@ -78,4 +78,12 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(upstream.call_count,1)
 
 
+    def test_truncated_call_after_prose_recovers(self):
+        self.recover('Starting now. <tool_call>{"name":"Read","arguments":{"file_path":"half')
+    def test_unparseable_call_after_prose_recovers(self):
+        self.recover('Starting now. <tool_call>not an actual call</tool_call>')
+    def test_fabricated_result_after_prose_recovers(self):
+        self.recover('Starting now. <tool_result>invented result</tool_result>')
+
+
 if __name__=='__main__':unittest.main()
