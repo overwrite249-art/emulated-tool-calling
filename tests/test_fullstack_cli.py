@@ -18,10 +18,16 @@ class FullstackCliTests(unittest.TestCase):
                     self.assertEqual(result.returncode,2)
                     self.assertIn('--max-output-tokens',result.stderr)
                     self.assertFalse(out.exists())
+    def test_invalid_reasoning_effort_creates_no_workspace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out=Path(directory)/'never-created'
+            result=subprocess.run([sys.executable,str(RUN),'--cli','not-invoked','--out-dir',str(out),'--reasoning-effort','unlimited'],env=dict(os.environ,EMU_UPSTREAM_API_KEY='test-only-never-sent'),capture_output=True,text=True,timeout=10)
+            self.assertEqual(result.returncode,2)
+            self.assertFalse(out.exists())
     def test_help_documents_focused_continuations(self):
         result=subprocess.run([sys.executable,str(RUN),'--help'],capture_output=True,text=True,timeout=10)
         self.assertEqual(result.returncode,0)
-        for flag in ('--focus','--resume-app','--thinking','--max-output-tokens'):
+        for flag in ('--focus','--resume-app','--thinking','--max-output-tokens','--json-output','--reasoning-effort'):
             self.assertIn(flag,result.stdout)
 
 if __name__=='__main__':unittest.main()
