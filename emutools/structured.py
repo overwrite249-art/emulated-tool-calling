@@ -87,15 +87,67 @@ def _structured_float(value):
     return number
 
 
-def extract_structured_output(content: str) -> Tuple[str, List[ToolCall]]:
+def _remove_surplus_closers(content: str) -> Optional[str]:
+    """Only delete up to two mismatched closers inside an open container.
+
+    Never add a token, change a primitive, repair an unterminated string, or
+    release a truncated envelope. Strict JSON decoding must succeed afterward.
+    """
+    stack = []
+    out = []
+    quoted = escaped = False
+    removed = 0
+    matching = {"}": "{", "]": "["}
+    for char in content:
+        if quoted:
+            out.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+            continue
+        if char == '"':
+            quoted = True
+        elif char in "{[":
+            stack.append(char)
+            if len(stack) > 128:
+                return None
+        elif char in "}]":
+            if not stack:
+                return None
+            if stack[-1] == matching[char]:
+                stack.pop()
+            else:
+                removed += 1
+                if removed > 2:
+                    return None
+                continue
+        out.append(char)
+    if quoted or stack or not removed:
+        return None
+    return "".join(out)
+
+
+def extract_structured_output(content: str, salvage: bool = False) -> Tuple[str, List[ToolCall]]:
     """Fail closed: never salvage partial source code or guess missing arguments."""
     if len(content) > STRUCTURED_LIMIT:
         raise ValueError("structured response exceeds the size limit")
+    repaired = False
     try:
         obj = json.loads(content, object_pairs_hook=_structured_pairs,
                          parse_constant=_structured_constant, parse_float=_structured_float)
     except (ValueError, RecursionError) as exc:
-        raise ValueError("invalid or incomplete JSON response") from exc
+        candidate = _remove_surplus_closers(content) if salvage else None
+        if candidate is None:
+            raise ValueError("invalid or incomplete JSON response") from exc
+        try:
+            obj = json.loads(candidate, object_pairs_hook=_structured_pairs,
+                             parse_constant=_structured_constant, parse_float=_structured_float)
+        except (ValueError, RecursionError) as repair_exc:
+            raise ValueError("invalid or incomplete JSON response") from repair_exc
+        repaired = True
     if not isinstance(obj, dict) or set(obj) != {"text", "tool_calls"}:
         raise ValueError("expected exactly text and tool_calls")
     if not isinstance(obj["text"], str) or not isinstance(obj["tool_calls"], list):
@@ -107,7 +159,7 @@ def extract_structured_output(content: str) -> Tuple[str, List[ToolCall]]:
                 or not isinstance(call["name"], str) or not call["name"]
                 or not isinstance(call["arguments"], dict)):
             raise ValueError("each call requires a name string and arguments object")
-        calls.append(ToolCall(name=call["name"], args=call["arguments"]))
+        calls.append(ToolCall(name=call["name"], args=call["arguments"], repaired=repaired))
     return obj["text"], calls
 
 
@@ -118,7 +170,8 @@ class StructuredToolParser:
     Wire-level streaming remains supported, but first-content latency includes
     generation of the complete JSON object. Nothing is parsed from reasoning.
     """
-    def __init__(self):
+    def __init__(self, salvage: bool = False):
+        self.salvage = salvage
         self.parts = []
         self.size = 0
         self.calls = []
@@ -134,7 +187,7 @@ class StructuredToolParser:
 
     def finish(self):
         try:
-            text, self.calls = extract_structured_output("".join(self.parts))
+            text, self.calls = extract_structured_output("".join(self.parts), salvage=self.salvage)
         except ValueError as exc:
             self.error = str(exc)
             self.calls = []

@@ -98,7 +98,7 @@ def run_turn(req: CanonRequest, cfg: Config) -> TurnResult:
                 total_usage[key] = total_usage.get(key, 0) + value
         if cfg.json_output:
             try:
-                text, calls = extract_structured_output(content)
+                text, calls = extract_structured_output(content, salvage=cfg.salvage_bare_json)
             except ValueError as exc:
                 if attempt == max_attempts:
                     raise UpstreamError("model returned invalid JSON output after %d attempt(s)" % attempt, 502) from exc
@@ -217,7 +217,7 @@ def _run_turn_stream_attempt(req: CanonRequest, cfg: Config, recovery_hint: str 
         extra = list(extra) + [recovery_hint]
     payload = _turn_payload(req, cfg, extra, allow_tools)
 
-    parser = StructuredToolParser() if cfg.json_output else StreamToolParser(tools_by_name, cfg.salvage_bare_json)
+    parser = StructuredToolParser(salvage=cfg.salvage_bare_json) if cfg.json_output else StreamToolParser(tools_by_name, cfg.salvage_bare_json)
     emitted_calls: List[ToolCall] = []
     seen_this_turn: Dict[str, int] = {}
     usage: Dict[str, Any] = {}
@@ -377,7 +377,7 @@ def anthropic_stream_bytes(req: CanonRequest, cfg: Config) -> Iterator[bytes]:
                 "content": [],
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0},
+                "usage": {"input_tokens": 0,"output_tokens": 0},
             },
         },
     )
@@ -523,7 +523,7 @@ def openai_stream_bytes(req: CanonRequest, cfg: Config, include_usage: bool) -> 
             "object": "chat.completion.chunk",
             "created": created,
             "model": model,
-            "choices": [{"index": 0, "delta": delta, "logprobs": None, "finish_reason": finish}],
+            "choices": [{"index": 0, "delta": delta, "logprobs": None,"finish_reason": finish}],
         }
         return ("data: %s\n\n" % json.dumps(obj, ensure_ascii=False)).encode("utf-8")
 
