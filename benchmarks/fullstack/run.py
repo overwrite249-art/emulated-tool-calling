@@ -82,12 +82,14 @@ def main():
     ap.add_argument('--thinking',choices=('enabled','disabled'),help='Explicit upstream thinking mode; omitted keeps the provider default')
     ap.add_argument('--max-output-tokens',type=int,default=6000,help='Per-response output allowance, 1..6000')
     ap.add_argument('--focus',default='',help='Additional reviewer feedback for a focused continuation')
+    ap.add_argument('--json-output',action='store_true',help='Use opt-in provider JSON response mode')
     a=ap.parse_args();key=os.environ.get('EMU_UPSTREAM_API_KEY') or os.environ.get('DEEPSEEK_API_KEY')
     if not 1<=a.max_output_tokens<=6000:ap.error('--max-output-tokens must be between 1 and 6000')
     if not key:ap.error('set EMU_UPSTREAM_API_KEY; this test makes paid requests')
     work=Path(a.out_dir).resolve();work.mkdir(parents=True,exist_ok=False);app=work/'app';app.mkdir();home=work/'home';home.mkdir()
     seed(app/'data/inventory.sqlite');resumed=copy_source(a.resume_app,app) if a.resume_app else []
     spec=(HERE/'SPEC.md').read_text()
+    spec+='\n\nYour current working directory is '+str(app)+'. All file tools must use paths inside that directory.\n'
     if resumed:
         spec+='\n\n## Continuation for this run\nUnfinished source from an earlier real model run is already present. Inspect it and finish it rather than starting over unnecessarily. The empty-workspace description does not apply to this continuation. All other requirements still apply. Use the current working directory, not paths from an earlier run.\n'
     if a.focus:spec+='\n\n## Reviewer feedback\n'+a.focus+'\n'
@@ -101,6 +103,7 @@ def main():
                    EMU_UPSTREAM_API_KEY=meter.token,EMU_MODEL_BIG='deepseek-v4-pro',EMU_MODEL_SMALL='deepseek-v4-pro',
                    EMU_PARALLEL='true',EMU_MAX_CALLS_PER_TURN='4',EMU_MAX_TOOL_ROUNDS='25',EMU_USE_STOP='false',
                    EMU_MAX_RETRIES='1',EMU_TIMEOUT='180',EMU_LOG_BODIES='false')
+    proxy_env['EMU_JSON_OUTPUT']='true' if a.json_output else 'false'
     if a.thinking:proxy_env['EMU_THINKING']=a.thinking
     client_env=dict(env,ANTHROPIC_BASE_URL=base,ANTHROPIC_API_KEY='dummy',ANTHROPIC_AUTH_TOKEN='dummy',
                     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC='1',CLAUDE_CODE_MAX_OUTPUT_TOKENS=str(a.max_output_tokens),MAX_THINKING_TOKENS='0')
@@ -112,7 +115,7 @@ def main():
              '--max-turns','30','--max-budget-usd','2.00','--system-prompt',
              'You are performing a real coding integration test. Implement the app, use the available tools, and verify actual outcomes. Work only in the provided app workspace. Never edit evaluator files or emutools. Keep output concise. Use independent tool calls in batches when safe. Do not install packages or access external services. Do not claim success without passing commands.',
              spec+'\nUse port '+str(app_port)+' for your server. To run the independent verifier: python3 '+str(HERE/'verify.py')+' --app '+str(app)+' --out-dir '+str(app/'acceptance-1')+'. Use a NEW output directory (acceptance-2 etc.) on each repeat. Fix failures before finishing.']
-    proxy=client=None;start=time.monotonic();result={'model':'deepseek-v4-pro','parallel_enabled':True,'max_calls_per_turn':4,'resumed_source_files':resumed,'thinking_mode':a.thinking or 'provider_default','output_token_limit':a.max_output_tokens,'reviewer_feedback_supplied':bool(a.focus)}
+    proxy=client=None;start=time.monotonic();result={'model':'deepseek-v4-pro','parallel_enabled':True,'max_calls_per_turn':4,'resumed_source_files':resumed,'thinking_mode':a.thinking or 'provider_default','output_token_limit':a.max_output_tokens,'reviewer_feedback_supplied':bool(a.focus),'json_output':a.json_output}
     try:
         with (work/'proxy.log').open('w') as log:
             proxy=subprocess.Popen([sys.executable,'-m','emutools'],cwd=REPO,env=proxy_env,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
