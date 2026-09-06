@@ -359,6 +359,11 @@ OPEN_TAG_NAMES = [
     "tool_use",
     "antml:invoke",
     "invoke",
+    # Bare vendor wrappers still require an explicitly named call in their body.
+    "｜｜dsml｜｜",
+    "||dsml||",
+    "｜dsml｜",
+    "|dsml|",
 ]
 
 _TAGS_ALT = "|".join(re.escape(t) for t in OPEN_TAG_NAMES)
