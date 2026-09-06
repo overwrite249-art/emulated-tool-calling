@@ -83,6 +83,16 @@ class Config:
     log_level: str = field(default_factory=lambda: _env("EMU_LOG", "info").lower())
     log_bodies: bool = field(default_factory=lambda: _env_bool("EMU_LOG_BODIES", False))
 
+    # Opt-in provider settings; empty values preserve generic upstream behavior.
+    thinking: str = field(default_factory=lambda: _env("EMU_THINKING", "").strip().lower())
+    reasoning_effort: str = field(default_factory=lambda: _env("EMU_REASONING_EFFORT", "").strip().lower())
+
+    def __post_init__(self) -> None:
+        if self.thinking not in ("", "enabled", "disabled"):
+            raise ValueError("EMU_THINKING must be enabled, disabled, or empty")
+        if self.reasoning_effort not in ("", "low", "medium", "high", "xhigh", "max"):
+            raise ValueError("EMU_REASONING_EFFORT must be low, medium, high, xhigh, max, or empty")
+
     def model_map(self) -> Dict[str, str]:
         if not self.model_map_raw.strip():
             return {}

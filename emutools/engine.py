@@ -68,6 +68,16 @@ def _call_issues(tc: ToolCall, req: CanonRequest, tools: Dict[str, ToolDef]) -> 
     return ["Call to `%s` is invalid: %s." % (tc.name, issue) for issue in validate_args(tc.args, tools[tc.name].schema)]
 
 
+def _turn_payload(req: CanonRequest, cfg: Config, extra: List[str], allow_tools: bool) -> Dict[str, Any]:
+    """Apply explicitly configured provider settings in both sync and streaming turns."""
+    payload = build_upstream_payload(req, cfg, extra, allow_tools)
+    if cfg.thinking:
+        payload["thinking"] = {"type": cfg.thinking}
+    if cfg.reasoning_effort:
+        payload["reasoning_effort"] = cfg.reasoning_effort
+    return payload
+
+
 def run_turn(req: CanonRequest, cfg: Config) -> TurnResult:
     """Bounded repairs; no rejected or schema-invalid call can reach a client."""
     st, extra, allow_tools = _prepare(req, cfg)
@@ -76,7 +86,7 @@ def run_turn(req: CanonRequest, cfg: Config) -> TurnResult:
     max_attempts = 3 if cfg.loop_retry else 1
 
     for attempt in range(1, max_attempts + 1):
-        payload = build_upstream_payload(req, cfg, extra, allow_tools)
+        payload = _turn_payload(req, cfg, extra, allow_tools)
         data = upstream_complete(cfg, payload)
         content, finish_reason, usage = extract_completion_text(data)
         text, calls = extract_tool_calls(content, tools_by_name, cfg.salvage_bare_json)
@@ -193,7 +203,7 @@ def _run_turn_stream_attempt(req: CanonRequest, cfg: Config, recovery_hint: str 
     tools_by_name = _tools_by_name(req)
     if recovery_hint:
         extra = list(extra) + [recovery_hint]
-    payload = build_upstream_payload(req, cfg, extra, allow_tools)
+    payload = _turn_payload(req, cfg, extra, allow_tools)
 
     parser = StreamToolParser(tools_by_name, cfg.salvage_bare_json)
     emitted_calls: List[ToolCall] = []
@@ -202,6 +212,8 @@ def _run_turn_stream_attempt(req: CanonRequest, cfg: Config, recovery_hint: str 
     finish_reason = "stop"
     any_text = False
     raw_len = 0
+    saw_call_syntax = False
+    syntax_tail = ""
 
     def consider(tc: ToolCall) -> Iterator[Tuple[str, Any]]:
         nonlocal any_text
@@ -246,6 +258,10 @@ def _run_turn_stream_attempt(req: CanonRequest, cfg: Config, recovery_hint: str 
         if not chunk:
             continue
         raw_len += len(chunk)
+        if not saw_call_syntax:
+            candidate = syntax_tail + chunk
+            saw_call_syntax = bool(_OPEN_RE.search(candidate))
+            syntax_tail = "" if saw_call_syntax else candidate[-8192:]
         before = len(parser.calls)
         pieces = parser.feed(chunk)
         for piece in pieces:
@@ -266,6 +282,8 @@ def _run_turn_stream_attempt(req: CanonRequest, cfg: Config, recovery_hint: str 
         for out in consider(tc):
             yield out
 
+    if allow_tools and not emitted_calls and not parser.calls and (saw_call_syntax or parser.discard_rest):
+        yield ("rejected", "The attempted call or fabricated result could not be safely parsed. Emit a complete tool call; do not invent results.")
     if allow_tools and req.tool_choice not in ("auto", "none") and not emitted_calls:
         yield ("required_missing", True)
     if not any_text and not emitted_calls:
@@ -587,6 +605,7 @@ __all__ = [
     "_prepare",
     "_call_limit",
     "_call_issues",
+    "_turn_payload",
     "run_turn",
     "run_turn_stream",
     "_run_turn_stream_attempt",
