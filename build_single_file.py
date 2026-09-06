@@ -22,7 +22,7 @@ HE = "# --- end generated header ---"
 
 # Dependency order: every definition appears before anything that runs it.
 ORDER = [
-    "_prelude", "core", "protocol", "wire", "engine", "server",
+    "_prelude", "core", "protocol", "wire", "structured", "engine", "server",
     "selftest_a", "selftest_b", "cli",
 ]
 

@@ -70,6 +70,7 @@ class Config:
     use_stop: bool = field(default_factory=lambda: _env_bool("EMU_USE_STOP", False))
     merge_roles: bool = field(default_factory=lambda: _env_bool("EMU_MERGE_ROLES", True))
     salvage_bare_json: bool = field(default_factory=lambda: _env_bool("EMU_SALVAGE", True))
+    json_output: bool = field(default_factory=lambda: _env_bool("EMU_JSON_OUTPUT", False))
     max_result_chars: int = field(default_factory=lambda: _env_int("EMU_MAX_RESULT_CHARS", 24000))
 
     # Inbound HTTP resource limits (the server is intended for loopback use).

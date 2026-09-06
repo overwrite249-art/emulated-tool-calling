@@ -4,6 +4,7 @@ from ._prelude import *  # noqa: F401,F403
 from .core import *  # noqa: F401,F403
 from .protocol import *  # noqa: F401,F403
 from .wire import *  # noqa: F401,F403
+from .structured import *  # noqa: F401,F403
 # --- end generated header ---
 
 
@@ -40,7 +41,7 @@ def _prepare(req: CanonRequest, cfg: Config) -> Tuple[LoopState, List[str], bool
     st = analyze_history(req.messages, cfg)
     extra = list(st.nudges)
     allow_tools = bool(req.tools) and req.tool_choice != "none" and not st.budget_exhausted
-    if allow_tools:
+    if allow_tools and not cfg.json_output:
         extra.append(
             "Final tool-format requirement: use flat <tool_call> blocks containing JSON with "
             "name and arguments. Put the exact declared tool name in the JSON name string. "
@@ -70,7 +71,8 @@ def _call_issues(tc: ToolCall, req: CanonRequest, tools: Dict[str, ToolDef]) -> 
 
 def _turn_payload(req: CanonRequest, cfg: Config, extra: List[str], allow_tools: bool) -> Dict[str, Any]:
     """Apply explicitly configured provider settings in both sync and streaming turns."""
-    payload = build_upstream_payload(req, cfg, extra, allow_tools)
+    payload = (build_structured_payload(req, cfg, extra, allow_tools, _call_limit(req, cfg))
+               if cfg.json_output else build_upstream_payload(req, cfg, extra, allow_tools))
     if cfg.thinking:
         payload["thinking"] = {"type": cfg.thinking}
     if cfg.reasoning_effort:
@@ -89,12 +91,21 @@ def run_turn(req: CanonRequest, cfg: Config) -> TurnResult:
         payload = _turn_payload(req, cfg, extra, allow_tools)
         data = upstream_complete(cfg, payload)
         content, finish_reason, usage = extract_completion_text(data)
-        text, calls = extract_tool_calls(content, tools_by_name, cfg.salvage_bare_json)
         if not usage:
             usage = {"prompt_tokens": _estimate_input_tokens(payload), "completion_tokens": estimate_tokens(content)}
         for key, value in usage.items():
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 total_usage[key] = total_usage.get(key, 0) + value
+        if cfg.json_output:
+            try:
+                text, calls = extract_structured_output(content)
+            except ValueError as exc:
+                if attempt == max_attempts:
+                    raise UpstreamError("model returned invalid JSON output after %d attempt(s)" % attempt, 502) from exc
+                extra = list(extra) + ["Your previous JSON response was invalid. " + str(exc) + ". Split large writes across turns."]
+                continue
+        else:
+            text, calls = extract_tool_calls(content, tools_by_name, cfg.salvage_bare_json)
         notes: List[str] = []
         if not allow_tools and calls:
             notes.append("Tool calls are disabled for this turn (choice or conversation budget); ignored %d call(s)." % len(calls))
@@ -188,8 +199,9 @@ def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]
         log_warn("retrying unusable streamed output (attempt %d/%d)" % (attempt, max_attempts))
         hint = ("Your last attempted tool call was unusable; NO tool was executed. "
                 "Correct it using the exact declared tool name and valid JSON arguments. "
-                "Use only flat <tool_call>{\"name\":\"TOOL_NAME\",\"arguments\":{...}}</tool_call> blocks. "
-                "Never fabricate results or repeat preceding prose. Split large writes across turns. "
+                + (STRUCTURED_INSTRUCTION if cfg.json_output else
+                   "Use only flat <tool_call>{\"name\":\"TOOL_NAME\",\"arguments\":{...}}</tool_call> blocks. ")
+                + "Never fabricate results or repeat preceding prose. Split large writes across turns. "
                 + " ".join(rejected[:4]))
 
 
@@ -205,7 +217,7 @@ def _run_turn_stream_attempt(req: CanonRequest, cfg: Config, recovery_hint: str 
         extra = list(extra) + [recovery_hint]
     payload = _turn_payload(req, cfg, extra, allow_tools)
 
-    parser = StreamToolParser(tools_by_name, cfg.salvage_bare_json)
+    parser = StructuredToolParser() if cfg.json_output else StreamToolParser(tools_by_name, cfg.salvage_bare_json)
     emitted_calls: List[ToolCall] = []
     seen_this_turn: Dict[str, int] = {}
     usage: Dict[str, Any] = {}
@@ -258,7 +270,7 @@ def _run_turn_stream_attempt(req: CanonRequest, cfg: Config, recovery_hint: str 
         if not chunk:
             continue
         raw_len += len(chunk)
-        if not saw_call_syntax:
+        if not cfg.json_output and not saw_call_syntax:
             candidate = syntax_tail + chunk
             saw_call_syntax = bool(_OPEN_RE.search(candidate))
             syntax_tail = "" if saw_call_syntax else candidate[-8192:]
@@ -282,7 +294,9 @@ def _run_turn_stream_attempt(req: CanonRequest, cfg: Config, recovery_hint: str 
         for out in consider(tc):
             yield out
 
-    if allow_tools and not emitted_calls and not parser.calls and (saw_call_syntax or parser.discard_rest):
+    if cfg.json_output and parser.error:
+        yield ("rejected", parser.error)
+    if not cfg.json_output and allow_tools and not emitted_calls and not parser.calls and (saw_call_syntax or parser.discard_rest):
         yield ("rejected", "The attempted call or fabricated result could not be safely parsed. Emit a complete tool call; do not invent results.")
     if allow_tools and req.tool_choice not in ("auto", "none") and not emitted_calls:
         yield ("required_missing", True)
