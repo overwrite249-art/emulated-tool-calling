@@ -70,6 +70,7 @@ class Config:
     use_stop: bool = field(default_factory=lambda: _env_bool("EMU_USE_STOP", False))
     merge_roles: bool = field(default_factory=lambda: _env_bool("EMU_MERGE_ROLES", True))
     salvage_bare_json: bool = field(default_factory=lambda: _env_bool("EMU_SALVAGE", True))
+    json_output: bool = field(default_factory=lambda: _env_bool("EMU_JSON_OUTPUT", False))
     max_result_chars: int = field(default_factory=lambda: _env_int("EMU_MAX_RESULT_CHARS", 24000))
 
     # Inbound HTTP resource limits (the server is intended for loopback use).
@@ -82,6 +83,16 @@ class Config:
 
     log_level: str = field(default_factory=lambda: _env("EMU_LOG", "info").lower())
     log_bodies: bool = field(default_factory=lambda: _env_bool("EMU_LOG_BODIES", False))
+
+    # Opt-in provider settings; empty values preserve generic upstream behavior.
+    thinking: str = field(default_factory=lambda: _env("EMU_THINKING", "").strip().lower())
+    reasoning_effort: str = field(default_factory=lambda: _env("EMU_REASONING_EFFORT", "").strip().lower())
+
+    def __post_init__(self) -> None:
+        if self.thinking not in ("", "enabled", "disabled"):
+            raise ValueError("EMU_THINKING must be enabled, disabled, or empty")
+        if self.reasoning_effort not in ("", "low", "medium", "high", "xhigh", "max"):
+            raise ValueError("EMU_REASONING_EFFORT must be low, medium, high, xhigh, max, or empty")
 
     def model_map(self) -> Dict[str, str]:
         if not self.model_map_raw.strip():
