@@ -147,4 +147,23 @@ class UnparsedTextTests(unittest.TestCase):
         self.assertEqual(upstream.call_count,1);self.assertEqual([c.args for c in result.calls],[{'value':value}])
 
 
+class PromptContractTests(unittest.TestCase):
+    def test_default_prompt_does_not_advertise_a_conflicting_raw_format(self):
+        from emutools.protocol import build_tool_prompt
+        for parallel in [False,True]:
+            prompt=build_tool_prompt([ToolDef('Read')],parallel)
+            self.assertNotIn('## Raw form',prompt)
+            self.assertNotIn('<arg name=',prompt)
+            self.assertIn('"name"',prompt)
+            self.assertIn('"arguments"',prompt)
+
+    def test_parallel_prompt_does_not_order_a_stop_after_the_first_call(self):
+        from emutools.protocol import build_tool_prompt
+        prompt=build_tool_prompt([ToolDef('Read')],True)
+        self.assertNotIn('STOP generating immediately after `</tool_call>`',prompt)
+        self.assertIn('last tool-call block',prompt)
+        self.assertIn('independent',prompt)
+        self.assertIn('at most ONE',build_tool_prompt([ToolDef('Read')],False))
+
+
 if __name__=='__main__':unittest.main()

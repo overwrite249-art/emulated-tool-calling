@@ -84,7 +84,7 @@ class AmbiguousCallTests(unittest.TestCase):
         for calls in variants(raw,tools):self.assertEqual([(c.name,c.args) for c in calls],[('Echo',args)])
 
     def test_colliding_normalized_names_are_not_arbitrarily_resolved(self):
-        for names,requested in [(['Read-File','Read_File'],'readfile'),(['Read','read'],'READ')]:
+        for names,requested in [(['Read-File','Read.File'],'readfile'),(['Read','read'],'READ')]:
             tools={name:ToolDef(name) for name in names};raw=render_tool_call_text(ToolCall(requested,{}))
             for calls in variants(raw,tools):self.assertFalse(any(c.name in tools for c in calls))
             def stream(*_):
@@ -94,8 +94,8 @@ class AmbiguousCallTests(unittest.TestCase):
             self.assertFalse([v for k,v in events if k=='call'])
 
     def test_exact_and_unique_normalized_names_remain_supported(self):
-        for tools,requested,expected in [({'Read-File':ToolDef('Read-File'),'Read_File':ToolDef('Read_File')},'Read-File','Read-File'),
-                                         ({'Read_File':ToolDef('Read_File')},'readfile','Read_File')]:
+        for tools,requested,expected in [({'Read-File':ToolDef('Read-File'),'Read.File':ToolDef('Read.File')},'Read-File','Read-File'),
+                                         ({'Read-File':ToolDef('Read-File')},'readfile','Read-File')]:
             raw=render_tool_call_text(ToolCall(requested,{}))
             for calls in variants(raw,tools):self.assertEqual([c.name for c in calls],[expected])
 
