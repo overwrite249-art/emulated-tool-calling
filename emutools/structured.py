@@ -3,6 +3,7 @@ from __future__ import annotations
 from ._prelude import *  # noqa: F401,F403
 from .core import *  # noqa: F401,F403
 from .wire import *  # noqa: F401,F403
+from .media import render_image_content
 # --- end generated header ---
 
 
@@ -49,7 +50,9 @@ def build_structured_payload(req: CanonRequest, cfg: Config, extra: List[str],
             ]})
         else:
             text = message.text
-        messages.append(CanonMessage(role=message.role, text=text))
+        content_parts = (render_image_content(message.content_parts, cfg, structured=True)
+                         if cfg.image_inputs and message.content_parts else [])
+        messages.append(CanonMessage(role=message.role, text=text, content_parts=content_parts))
     effective = CanonRequest(
         model=req.model, messages=messages, system=req.system, tools=[], tool_choice="none",
         max_tokens=req.max_tokens, temperature=req.temperature, top_p=req.top_p,

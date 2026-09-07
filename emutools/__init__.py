@@ -31,6 +31,7 @@ Zero dependencies. Python 3.9+. Single file.
 from ._prelude import *  # noqa: F401,F403
 from .core import *  # noqa: F401,F403
 from .protocol import *  # noqa: F401,F403
+from .media import *  # noqa: F401,F403
 from .wire import *  # noqa: F401,F403
 from .structured import *  # noqa: F401,F403
 from .engine import *  # noqa: F401,F403
