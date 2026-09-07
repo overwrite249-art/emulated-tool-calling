@@ -676,6 +676,14 @@ def build_upstream_messages(req: CanonRequest, cfg: Config, extra_system: List[s
             "<tool_call> block."
         )
 
+    if any(msg.tool_calls or msg.tool_results for msg in req.messages):
+        system_chunks.append(
+            "Tool call/result history_id labels identify actual previous calls. Results "
+            "may arrive out of order: match each result to the call with the same history_id "
+            "and its arguments, not by position. These labels are history metadata; do not "
+            "copy history_id into new tool calls."
+        )
+
     for note in extra_system:
         if note:
             system_chunks.append(note)
@@ -690,16 +698,16 @@ def build_upstream_messages(req: CanonRequest, cfg: Config, extra_system: List[s
             if msg.text:
                 parts.append(msg.text)
             for tc in msg.tool_calls:
-                parts.append(render_tool_call_text(tc))
+                parts.append(history_note("Tool call", tc.id) + render_tool_call_text(tc))
             body = "\n\n".join(p for p in parts if p).strip()
             out.append({"role": "assistant", "content": body or "(no output)"})
         elif cfg.image_inputs and msg.content_parts:
             out.append({"role": "user", "content": render_image_content(msg.content_parts, cfg)})
         else:
             parts = []
-            for _tid, name, content, is_err in msg.tool_results:
+            for tid, name, content, is_err in msg.tool_results:
                 parts.append(
-                    render_tool_result_text(name, content, is_err, cfg.max_result_chars)
+                    history_note("Tool result", tid) + render_tool_result_text(name, content, is_err, cfg.max_result_chars)
                 )
             if msg.text:
                 parts.append(msg.text)
