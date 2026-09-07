@@ -23,8 +23,9 @@ from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT))
-from emutools import Config,Handler,Server,iter_sse
+from emutools import Config,Handler,Server,iter_sse,history_note
 from benchmarks.vision.probe import MODEL,make_image,decode_answer
+from benchmarks.vision.client_trace import inspect_cli_trace,score_observations
 
 LIMIT=.02
 MAX_REQUESTS=8
@@ -91,7 +92,8 @@ class Meter:
                 n=record['number'];(out/('request-%02d.json'%n)).write_bytes(raw)
                 status=502;response_raw=b'';kind='application/json';usage={};cost=reservation
                 try:
-                    request=urllib.request.Request('https://api.deepseek.com/chat/completions',data=raw,headers={'Content-Type':'application/json','Authorization':'Bearer '+owner.key})
+                    url='/'.join(['https:','','api.deepseek.com','chat','completions'])
+                    request=urllib.request.Request(url,data=raw,headers={'Content-Type':'application/json','Authorization':'Bearer '+owner.key})
                     with urllib.request.urlopen(request,timeout=45) as response:
                         status=response.status;kind=response.headers.get('Content-Type','application/json');response_raw=response.read(1000000)
                     if payload.get('stream'):
@@ -103,6 +105,7 @@ class Meter:
                 except urllib.error.HTTPError as exc:
                     status=exc.code;response_raw=exc.read(20000)
                 except Exception as exc:
+                    status=502;kind='application/json'
                     response_raw=json.dumps({'error':{'message':'capture transport failure','type':type(exc).__name__}}).encode()
                 finally:
                     (out/('response-%02d.bin'%n)).write_bytes(response_raw)
@@ -140,13 +143,42 @@ def anthropic_calls(raw):
 
 
 def score(calls):
-    result={}
-    for call in calls:
-        args=call.get('arguments',{});fixture=args.get('fixture')
-        if call.get('name')=='record_scene' and fixture in EXPECTED:
-            result[fixture]={'observed':{k:args.get(k) for k in EXPECTED[fixture]},'exact':all(args.get(k)==v for k,v in EXPECTED[fixture].items()),
-                             'shapes_and_colors_correct':all(args.get(k)==EXPECTED[fixture][k] for k in ['blue_circles','triangle_color'])}
-    return result
+    return score_observations(calls,EXPECTED)
+
+
+def audit_native_history(trace_text,records,out,fixture_hashes):
+    """Check image bytes against the actual originating Read, not result position."""
+    origins={};known={'sample-'+k+'.png':v for k,v in fixture_hashes.items()}
+    for line in trace_text.splitlines():
+        try:event=json.loads(line)
+        except ValueError:continue
+        if event.get('type')!='assistant':continue
+        for block in event.get('message',{}).get('content',[]):
+            if block.get('type')=='tool_use' and block.get('name')=='Read' and block.get('id'):
+                name=Path(block.get('input',{}).get('file_path','')).name
+                if name in known:origins[block['id']]=name
+    checked=matched=0;correlated=set();out_of_order=False
+    for record in records:
+        if not record['image_sha256']:continue
+        payload=json.loads((out/('request-%02d.json'%record['number'])).read_text())
+        assistant='\n'.join(m['content'] for m in payload['messages'] if m['role']=='assistant' and isinstance(m['content'],str))
+        order=[]
+        for message in payload['messages']:
+            if message['role']!='user' or not isinstance(message.get('content'),list):continue
+            active=None
+            for part in message['content']:
+                if part['type']=='text':
+                    for identifier in origins:
+                        if part['text'].startswith(history_note('Tool result',identifier)):active=identifier;break
+                elif part['type']=='image_url':
+                    digest=hashlib.sha256(base64.b64decode(part['image_url']['url'].split(',',1)[1],validate=True)).hexdigest();checked+=1
+                    order.extend(name for name,value in known.items() if value==digest)
+                    if active in origins and known[origins[active]]==digest and history_note('Tool call',active) in assistant:
+                        matched+=1;correlated.add(origins[active])
+        requested=list(origins.values())
+        if len(order)==len(requested)==2 and set(order)==set(requested) and order!=requested:out_of_order=True
+    return {'images_checked':checked,'images_with_matching_call_id':matched,'both_reads_correlated':set(known)<=correlated and matched==checked,
+            'out_of_order_results_observed':out_of_order}
 
 
 def main():
@@ -193,21 +225,17 @@ def main():
                 client=subprocess.Popen(command,cwd=work,env=env,stdout=stdout,stderr=stderr);(out/'client.pid').write_text(str(client.pid))
                 try:code=client.wait(timeout=150)
                 except subprocess.TimeoutExpired:client.kill();code=client.wait(timeout=10)
-            reads=[];maximum=0;final=''
-            for line in (out/'client.jsonl').read_text().splitlines():
-                try:event=json.loads(line)
-                except ValueError:continue
-                if event.get('type')=='assistant':
-                    blocks=event.get('message',{}).get('content',[]);tools=[x for x in blocks if x.get('type')=='tool_use'];maximum=max(maximum,len(tools))
-                    reads.extend(Path(x.get('input',{}).get('file_path','')).name for x in tools if x.get('name')=='Read')
-                elif event.get('type')=='result':final=event.get('result','')
-            try:answer=decode_answer(final)
-            except (ValueError,TypeError):answer=None
+            trace_text=(out/'client.jsonl').read_text();trace=inspect_cli_trace(trace_text);reads=trace['read_paths'];maximum=trace['max_calls_in_one_response']
+            try:answer=decode_answer(trace['final'])
+            except (ValueError,TypeError,AttributeError):answer=None
             observations=score([{'name':'record_scene','arguments':dict(value,fixture=ident)} for ident,value in answer.items() if isinstance(value,dict)]) if isinstance(answer,dict) else {}
-            sent=meter.records[before:];forwarded={h for record in sent for h in record['image_sha256']}
+            sent=meter.records[before:];forwarded={h for record in sent for h in record['image_sha256']};audit=audit_native_history(trace_text,sent,out,hashes)
+            complete=set(observations)=={'a','b'} and all(x['schema_valid'] for x in observations.values())
             result['native_client']={'version':subprocess.check_output([str(args.cli),'--version'],text=True,timeout=10).strip(),'exit_code':code,'elapsed_seconds':round(time.monotonic()-started,2),
-               'actual_read_paths':reads,'max_calls_in_one_response':maximum,'both_fixture_image_hashes_forwarded':set(hashes.values())<=forwarded,'observations':observations,
-               'workflow_pass':code==0 and {'sample-a.png','sample-b.png'}<=set(reads) and set(hashes.values())<=forwarded and set(observations)=={'a','b'}}
+               'actual_read_paths':reads,'max_calls_in_one_response':maximum,'both_fixture_image_hashes_forwarded':set(hashes.values())<=forwarded,'observations':observations,'history_audit':audit,
+               'read_workflow_pass':code==0 and {'sample-a.png','sample-b.png'}<=set(reads) and set(hashes.values())<=forwarded and complete,
+               'batching_pass':maximum>=2,'shape_answers_pass':complete and all(x['shapes_and_colors_correct'] for x in observations.values()),
+               'exact_answers_pass':complete and all(x['exact'] for x in observations.values())}
             print(json.dumps(result['native_client']),flush=True)
     except Exception as exc:
         result['error']={'type':type(exc).__name__,'message':str(exc)[:500]}
@@ -216,9 +244,14 @@ def main():
         deadline=time.monotonic()+50
         while meter.inflight and time.monotonic()<deadline:time.sleep(.1)
         result['budget']=meter.summary();meter.close()
-        result['scope']='Real provider through emutools; the HTTP tool-result case uses synthetic history. Only native_client reports actual CLI tool execution. OCR exactness is separate from transport/workflow.'
+        result['scope']='Real provider through emutools; the HTTP tool-result case uses synthetic history. Only native_client reports actual CLI tool execution. OCR exactness is separate from transport, correlation, and batching.'
+        result['http_transport_and_calls_pass']=(len(result['http_cases'])==2 and all(c['image_bytes_preserved'] and c['status']==200 for c in result['http_cases']) and
+            [c['calls_in_one_response'] for c in result['http_cases']]==[2,1] and all(c['observations'] and all(o['schema_valid'] for o in c['observations'].values()) for c in result['http_cases']))
+        native=result.get('native_client')
+        result['transport_and_workflow_pass']=not result.get('error') and result['http_transport_and_calls_pass'] and (not args.cli or bool(native and native['read_workflow_pass'] and native['batching_pass'] and native['history_audit']['both_reads_correlated']))
+        result['exact_vision_pass']=result['transport_and_workflow_pass'] and all(o['exact'] for c in result['http_cases'] for o in c['observations'].values()) and (not args.cli or native['exact_answers_pass'])
         (out/'result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2));print(json.dumps(result,ensure_ascii=False,indent=2),flush=True)
-    return 0 if not result.get('error') and all(c['image_bytes_preserved'] and c['status']==200 for c in result['http_cases']) and (not args.cli or result['native_client'] and result['native_client']['workflow_pass']) else 1
+    return 0 if result['exact_vision_pass'] else 1
 
 
 if __name__=='__main__':raise SystemExit(main())
