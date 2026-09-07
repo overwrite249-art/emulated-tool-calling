@@ -23,6 +23,14 @@ A final answer has a string `text` and an empty `tool_calls` array. The example 
 - Tool availability, input schemas, named/required/disabled choices, per-turn limits, and repeat/round guards still apply.
 - History is serialized consistently as JSON, including identifiers connecting real tool results to earlier calls.
 
+## Image-bearing history
+
+Image forwarding is a separate opt-in: enable `EMU_IMAGE_INPUTS=true` and choose a compatible vision target. JSON output mode alone does not enable images.
+
+With both options enabled, actual user images remain image content blocks. Image-bearing tool results keep JSON records containing their real call IDs, tool names, error state, and textual image references. Real image blocks follow in the referenced order. This prevents the image payload from becoming an omission placeholder or ordinary base64 text inside the response envelope.
+
+The JSON history already has explicit IDs; it does not need the text-mode `history_id` labels. Matching IDs matters when two calls to the same tool finish out of order. See [image support and limits](image-inputs.md). Offline HTTP tests cover this combination; the dated report distinguishes those tests from paid live-model checks.
+
 ## Streaming trade-off
 
 The upstream connection and client wire format can still use SSE. However, emutools buffers the **whole JSON envelope** before emitting its text or calls, up to 524,288 characters. This increases first-content latency relative to the default incremental text parser. An incomplete response cannot release even an earlier complete-looking call.
@@ -45,6 +53,7 @@ DeepSeek documents both JSON output and a possibility of empty responses. In the
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_structured_output.py' -v
+python3 -m unittest discover -s tests -p 'test_image_inputs.py' -v
 python3 -m unittest discover -s tests -v
 python3 -m emutools --selftest
 python3 build_single_file.py /tmp/emutools.py
@@ -53,8 +62,9 @@ python3 /tmp/emutools.py --selftest
 
 Run the offline suites with a clean test environment rather than inheriting production generation settings. The focused tests cover exact string preservation, guarded batching, bounded buffering, malformed envelopes, sync/stream repair, usage aggregation, and no replay after delivered calls or transport failures.
 
-Provider references, checked September 6, 2026:
+Provider references, checked September 6, 2026; image support updated September 7:
 
 - https://api-docs.deepseek.com/guides/json_mode/
 - https://api-docs.deepseek.com/guides/thinking_mode
 - https://api-docs.deepseek.com/quick_start/pricing/
+- https://api-docs.deepseek.com/guides/vision
