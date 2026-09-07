@@ -485,13 +485,57 @@ def _parse_attrs(raw: Optional[str]) -> Dict[str, str]:
     return out
 
 
+# Observed legacy hybrid: {"name": "Read"> followed ONLY by named raw args.
+# This is a narrowly recognized grammar, not a general JSON punctuation repair.
+_HYBRID_HEADER_RE = re.compile(r'\A\s*\{\s*"name"\s*:\s*("(?:[^"\\]|\\.){1,1024}")\s*>\s*', re.DOTALL)
+
+
+def _hybrid_body(body: str) -> Optional[Tuple[str, str]]:
+    body = strip_fences(body)
+    header = _HYBRID_HEADER_RE.match(body)
+    if not header:
+        return None
+    try:
+        name = json.loads(header.group(1))
+    except ValueError:
+        return None
+    if not isinstance(name, str) or not name:
+        return None
+    arguments = body[header.end():]
+    matches = list(_ARG_RE.finditer(arguments))
+    if not matches:
+        return None
+    cursor = 0
+    seen = set()
+    for match in matches:
+        if arguments[cursor:match.start()].strip():
+            return None
+        attrs = _parse_attrs(match.group(2))
+        keys = [attrs[k] for k in ("name", "key") if attrs.get(k)]
+        if attrs.get(_ATTR_CONFLICT) or not keys or len(set(keys)) != 1 or keys[0] in seen:
+            return None
+        seen.add(keys[0])
+        cursor = match.end()
+    if arguments[cursor:].strip():
+        return None
+    return name, arguments
+
+
 def _find_close(text: str, tag: str, start: int) -> Tuple[int, int]:
     """Find syntax, not a closing tag embedded in JSON or raw argument data."""
-    close_re = re.compile(r"</\s*" + _VENDOR + re.escape(tag) + r"\s*>", re.IGNORECASE)
     body = strip_fences(text[start:]).lstrip()
-    is_json = body.startswith(("{", "["))
+    hybrid = bool(_HYBRID_HEADER_RE.match(body))
+    endings = "(?:" + re.escape(tag) + "|invoke|tool_call)" if hybrid else re.escape(tag)
+    close_re = re.compile(r"</\s*" + _VENDOR + endings + r"\s*>", re.IGNORECASE)
+    is_json = body.startswith(("{", "[")) and not hybrid
     for match in close_re.finditer(text, start):
         segment = text[start:match.start()]
+        if hybrid:
+            # An alternate closer is a boundary only after the entire explicit
+            # argument list. Markup inside an argument cannot terminate a call.
+            if _hybrid_body(segment):
+                return match.start(), match.end()
+            continue
         if is_json:
             quote = ""
             escaped = False
@@ -726,6 +770,12 @@ def parse_call_body(
     if len(set(outer_names)) > 1:
         return None
     name = outer_names[0] if outer_names else ""
+    hybrid = _hybrid_body(body)
+    if hybrid:
+        hybrid_name, arguments = hybrid
+        if hybrid_name not in tools_by_name or name and name != hybrid_name:
+            return None
+        name, body = hybrid_name, arguments
 
     arg_matches = [] if body.lstrip().startswith(("{", "[")) else list(_ARG_RE.finditer(body))
     if arg_matches:
