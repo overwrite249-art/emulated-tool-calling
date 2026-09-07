@@ -26,6 +26,68 @@ class TurnResult:
 EMPTY_FALLBACK = "(The model returned an empty response.)"
 
 
+class _ToolWrapperTracker:
+    """Bounded, line-aware detection of attempted plural call containers.
+
+    This class NEVER extracts a tool name or invents arguments. Fenced examples
+    and ordinary prose mentions are not classified as attempted containers.
+    """
+
+    def __init__(self) -> None:
+        self.line = ""
+        self.fence = ""
+        self.fence_width = 0
+        self.seen = False
+
+    def _inspect(self) -> None:
+        line = self.line.lstrip()
+        fence = re.match(r"(`{3,}|~{3,})", line)
+        if fence:
+            marker = fence.group(1)
+            if not self.fence:
+                self.fence, self.fence_width = marker[0], len(marker)
+            elif marker[0] == self.fence and len(marker) >= self.fence_width and not line[fence.end():].strip():
+                self.fence = ""
+            return
+        if self.fence:
+            return
+        wrapper = _WRAPPER_RE.match(line)
+        if wrapper and not line.startswith("</"):
+            rest = line[wrapper.end():].lstrip()
+            if not rest or rest.startswith(("<", "{", "[")):
+                self.seen = True
+
+    def feed(self, chunk: str) -> None:
+        if self.seen:
+            return
+        for index, piece in enumerate(chunk.replace("\r", "\n").split("\n")):
+            if index:
+                self._inspect()
+                self.line = ""
+            if len(self.line) < 8192:
+                if not self.line:
+                    piece = piece.lstrip()
+                self.line = (self.line + piece)[:8192]
+
+    def finish(self) -> None:
+        self._inspect()
+
+
+_UNPARSED_TOOL_REASON = (
+    "The attempted tool call, call wrapper, or fabricated result could not be safely parsed. "
+    "Use flat JSON call blocks with declared names; do not use a tool name as an XML tag "
+    "or invent results."
+)
+
+
+def _unparsed_text_attempt(content: str) -> bool:
+    wrappers = _ToolWrapperTracker()
+    wrappers.feed(content)
+    wrappers.finish()
+    return bool(wrappers.seen or _OPEN_RE.search(content) or
+                re.search(r"<" + _VENDOR + r"tool_result\b[^>]*>", content, re.IGNORECASE))
+
+
 def _tools_by_name(req: CanonRequest) -> Dict[str, ToolDef]:
     return {t.name: t for t in req.tools}
 
@@ -106,12 +168,13 @@ def run_turn(req: CanonRequest, cfg: Config) -> TurnResult:
                 continue
         else:
             text, calls = extract_tool_calls(content, tools_by_name, cfg.salvage_bare_json)
+        unparsed = bool(allow_tools and not cfg.json_output and not calls and _unparsed_text_attempt(content))
         notes: List[str] = []
         if not allow_tools and calls:
             notes.append("Tool calls are disabled for this turn (choice or conversation budget); ignored %d call(s)." % len(calls))
             calls = []
         valid: List[ToolCall] = []
-        problems: List[str] = []
+        problems: List[str] = [_UNPARSED_TOOL_REASON] if unparsed else []
         for tc in calls:
             issues = _call_issues(tc, req, tools_by_name)
             if issues:
@@ -133,6 +196,10 @@ def run_turn(req: CanonRequest, cfg: Config) -> TurnResult:
             log_warn("retrying rejected tool output: %s" % retry_reasons[0][:160])
             extra = list(extra) + ["CRITICAL: Your previous tool call was rejected. " + " ".join(retry_reasons)]
             continue
+        if unparsed:
+            if cfg.loop_retry or requires_call:
+                raise UpstreamError("model returned no usable response after %d attempt(s)" % attempt, 502)
+            text = "I stopped without executing an unparseable tool request. " + _UNPARSED_TOOL_REASON
         if requires_call and not kept:
             raise UpstreamError("model failed to satisfy tool_choice=%s after %d attempt(s)" % (req.tool_choice, attempt), 502)
         notes.extend(problems + blocked)
@@ -201,7 +268,7 @@ def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]
                 "Correct it using the exact declared tool name and valid JSON arguments. "
                 + (STRUCTURED_INSTRUCTION if cfg.json_output else
                    "Use only flat <tool_call>{\"name\":\"TOOL_NAME\",\"arguments\":{...}}</tool_call> blocks. ")
-                + "Never fabricate results or repeat preceding prose. Split large writes across turns. "
+                + "Do not use tool names as XML tags. Never fabricate results or repeat preceding prose. Split large writes across turns. "
                 + " ".join(rejected[:4]))
 
 
@@ -226,6 +293,7 @@ def _run_turn_stream_attempt(req: CanonRequest, cfg: Config, recovery_hint: str 
     raw_len = 0
     saw_call_syntax = False
     syntax_tail = ""
+    wrappers = _ToolWrapperTracker()
 
     def consider(tc: ToolCall) -> Iterator[Tuple[str, Any]]:
         nonlocal any_text
@@ -270,6 +338,8 @@ def _run_turn_stream_attempt(req: CanonRequest, cfg: Config, recovery_hint: str 
         if not chunk:
             continue
         raw_len += len(chunk)
+        if not cfg.json_output:
+            wrappers.feed(chunk)
         if not cfg.json_output and not saw_call_syntax:
             candidate = syntax_tail + chunk
             saw_call_syntax = bool(_OPEN_RE.search(candidate))
@@ -284,6 +354,8 @@ def _run_turn_stream_attempt(req: CanonRequest, cfg: Config, recovery_hint: str 
             for out in consider(tc):
                 yield out
 
+    if not cfg.json_output:
+        wrappers.finish()
     before = len(parser.calls)
     tail_pieces, _all_calls = parser.finish()
     for piece in tail_pieces:
@@ -296,8 +368,8 @@ def _run_turn_stream_attempt(req: CanonRequest, cfg: Config, recovery_hint: str 
 
     if cfg.json_output and parser.error:
         yield ("rejected", parser.error)
-    if not cfg.json_output and allow_tools and not emitted_calls and not parser.calls and (saw_call_syntax or parser.discard_rest):
-        yield ("rejected", "The attempted call or fabricated result could not be safely parsed. Emit a complete tool call; do not invent results.")
+    if not cfg.json_output and allow_tools and not emitted_calls and not parser.calls and (saw_call_syntax or wrappers.seen or parser.discard_rest):
+        yield ("rejected", _UNPARSED_TOOL_REASON)
     if allow_tools and req.tool_choice not in ("auto", "none") and not emitted_calls:
         yield ("required_missing", True)
     if not any_text and not emitted_calls:
