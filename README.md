@@ -81,10 +81,12 @@ Keep your coding client's tool permissions enabled.
   upstream streams produce protocol errors, not successful-looking assistant replies.
 - Literal `</tool_call>`, `<arg>` and DSML markup inside JSON arguments remain data rather
   than being mistaken for syntax or silently rewritten.
-- A fabricated `<tool_result>` discards the entire dependent continuation, including
-  additional calls that relied on a tool result which never existed.
+- Recognized fabricated `<tool_result>` output at protocol boundaries discards the
+  dependent continuation, including calls that relied on an observation which never existed.
 - Unterminated JSON strings are not invented. Bare JSON salvage is held back until it can
   be classified, avoiding visible JSON followed by a duplicate tool call.
+- Conflicting names or argument locations, duplicate JSON/XML declarations, and non-finite
+  literals are rejected instead of silently selecting an interpretation.
 - `tool_choice=none`, named tool choice, schema validation and call limits are enforced
   before calls reach clients—not merely requested in the model prompt.
 - Inbound request validation returns 400/413/408 for invalid, oversized or timed-out
@@ -92,10 +94,14 @@ Keep your coding client's tool permissions enabled.
 - Server instances use their own configuration. Model-map syntax matches the docs.
 - Anthropic streams report input usage; streamed and non-streaming repair attempts accumulate usage.
 - Streamed empty, rejected and nested-call responses receive bounded recovery without replaying delivered calls.
+- Malformed reserved text wrappers receive bounded recovery; ordinary prose is not turned into invented calls.
+- A narrow explicit-name/XML-parameter hybrid is recognized only at validated boundaries.
 - Optional JSON envelopes preserve arbitrary source strings and apply the same local tool-policy guards.
 - Opt-in image forwarding preserves image bytes rather than sending omission placeholders.
 - Actual call/result identifiers remain in history, including when parallel calls to the
   same tool finish out of order. This applies to text results and image-bearing results.
+- Optional older-result text limits reduce retained observations without changing call
+  arguments, current-batch allowances, original canonical history, or loop-guard inputs.
 
 ## Endpoints
 
@@ -118,11 +124,15 @@ In particular, this is not a claim of Codex CLI compatibility.
 </tool_call>
 ```
 
-The parser also handles common tag aliases, raw XML-style arguments, single-quoted
-pseudo-JSON, trailing commas, Python literals, and missing structural closing tags.
-DeepSeek's fullwidth `｜｜DSML｜｜` markup is recognized at syntax boundaries without
-normalizing literal argument content. Complete named JSON calls in bare DSML wrappers
-are also recognized. Arbitrary invented tag dialects are not guaranteed to work.
+The default prompt requests this flat JSON format consistently. The parser also handles
+common tag aliases, raw XML-style arguments, single-quoted pseudo-JSON, trailing commas,
+Python literals, and some missing structural closing tags. DeepSeek's fullwidth
+`｜｜DSML｜｜` markup is recognized at syntax boundaries without normalizing literal argument
+content. Complete named JSON calls in bare DSML wrappers and a narrow observed hybrid
+format are also recognized. Arbitrary invented dialects are not guaranteed to work.
+
+See [text format, recovery boundaries and context controls](docs/text-protocol.md).
+Missing names, conflicting values and incomplete source strings are not guessed.
 
 **`EMU_USE_STOP` now defaults to `false`.** A literal `</tool_call>` stop sequence can cut
 file content mid-string. Opt in with `EMU_USE_STOP=true` only when that trade-off is
@@ -181,6 +191,22 @@ History labels connect prior calls and results by their actual identifiers, not 
 completion order. They are metadata, not new tool arguments. Metadata cannot force a
 model to reason correctly about an observation; check actual outputs independently.
 
+### Optional older-result limits
+
+```bash
+EMU_MAX_RESULT_CHARS=8192 EMU_HISTORY_RESULT_CHARS=512 python3 -m emutools
+```
+
+The history setting defaults to `0` (disabled). A positive value additionally shortens
+older tool-result text; the latest assistant tool-call batch keeps the normal per-result
+allowance, even when its results are split across messages or finish out of order. IDs,
+names, error status and image bytes remain intact. Omissions are marked, not replaced with
+invented summaries. Original history and call arguments are not mutated.
+
+This is lossy context management, not an aggregate token budget or a guaranteed model-quality
+improvement. Important older details may need targeted rereads. See the
+[text protocol guide](docs/text-protocol.md) for exact behavior and trade-offs.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -203,6 +229,7 @@ model to reason correctly about an observation; check actual outputs independent
 | `EMU_REASONING_EFFORT` | empty | `low`, `medium`, `high`, `xhigh`, `max`; provider-dependent |
 | `EMU_SALVAGE` | `true` | Recover bare JSON calls; in JSON mode, narrowly recover surplus closing brackets |
 | `EMU_MAX_RESULT_CHARS` | `24000` | Text-only middle truncation; multimodal tool-result text prefix budget |
+| `EMU_HISTORY_RESULT_CHARS` | `0` | Additional older-result text cap; 0 disables, latest batch keeps normal allowance |
 | `EMU_MAX_REQUEST_BYTES` | `16777216` | 16 MiB limit for length and chunked bodies, including base64 images |
 | `EMU_CLIENT_TIMEOUT` | `30` | Client socket timeout in seconds |
 | `EMU_TIMEOUT` / `EMU_MAX_RETRIES` | `300` / `3` | Upstream timeout and connection attempts |
@@ -216,7 +243,7 @@ EMU_MODEL_MAP='my-model=deepseek-v4-pro,tiny=deepseek-v4-flash' \
 ## Tests and single-file deployment
 
 ```bash
-python3 -m unittest discover -s tests -v  # 154 regressions, including real sockets
+python3 -m unittest discover -s tests -v  # 213 regressions, including real sockets
 python3 -m emutools --selftest            # 200 built-in checks and parser fuzzing
 python3 build_single_file.py /tmp/emutools.py
 python3 /tmp/emutools.py --selftest       # same 200 checks, standalone
@@ -243,18 +270,38 @@ small output/turn limits, a wall-clock timeout and narrow tool permissions. The 
 is supplied only to the proxy, not to the CLI or its stdio MCP process. Live costs are
 not the same as a client's estimate for the advertised Claude alias.
 
+### Bounded full-stack continuations
+
+The full-stack runner is also paid. Choose a spending limit deliberately and a fresh
+output directory. For an existing model-authored checkpoint:
+
+```bash
+python3 benchmarks/fullstack/run.py --cli "$(command -v claude)" \
+  --out-dir /tmp/emutools-fullstack-check \
+  --resume-app examples/claude-stockroom --compact-continuation \
+  --thinking disabled --max-output-tokens 2000 \
+  --max-result-chars 8192 --history-result-chars 512 --budget-usd 0.10
+```
+
+The compact mode keeps the full contract in `REQUIREMENTS.md`; it does not relax acceptance
+checks. The evaluator, seeded MCP tools and conservative financial reservation guard are
+unchanged. A reservation can reject a new request even when completed-request charges are
+below the limit. That is not proof of provider-account depletion.
+
 The small smoke test passed with the real model, but **the harder full-stack challenge
 has not passed**. The inventory checkpoint is not production-ready. Read the dated
 [smoke-test report](docs/testing-2026-09-05.md),
-[full-stack/vision baseline](docs/fullstack-and-vision-2026-09-06.md), and
-[image-forwarding follow-up](docs/vision-and-correlation-2026-09-07.md) for observed evidence
-and limits. Live OpenCode testing on the small VPS was blocked by memory pressure.
+[full-stack/vision baseline](docs/fullstack-and-vision-2026-09-06.md),
+[image-forwarding follow-up](docs/vision-and-correlation-2026-09-07.md), and
+[text-tool hardening and live results](docs/text-tool-hardening-2026-09-07.md).
+The latest text continuations still made no app-source repairs. Live OpenCode testing on
+the small VPS was blocked by memory pressure; deterministic real-client CI is a separate result.
 
 ## Layout
 
 | Path | Contents |
 | --- | --- |
-| `emutools/core.py` | Configuration, canonical types, utilities |
+| `emutools/core.py` | Configuration, canonical types, utilities and rendering-only history limits |
 | `emutools/protocol.py` | Prompts, tolerant parsing, incremental tool parser, validation |
 | `emutools/media.py` | Opt-in image normalization, validation and correlated result rendering |
 | `emutools/wire.py` | Loop state, upstream HTTP/SSE, request translation |
@@ -274,6 +321,7 @@ and limits. Live OpenCode testing on the small VPS was blocked by memory pressur
 
 - Emulation adds prompt tokens and depends on the model following a text protocol.
 - Validation and repair are defensive heuristics, not a guarantee that a tool call is safe.
+- Optional older-result clipping can remove details the model later needs; it is not an exact token budget.
 - Image forwarding is opt-in and upstream-dependent. Documents/audio and unsupported image source types are not implemented.
 - System/assistant image inputs are not forwarded. Provider Files API references are not supported.
 - Token counting is approximate, especially for multimodal input; do not use it as exact image billing or admission control.
