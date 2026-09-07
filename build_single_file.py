@@ -22,7 +22,7 @@ HE = "# --- end generated header ---"
 
 # Dependency order: every definition appears before anything that runs it.
 ORDER = [
-    "_prelude", "core", "protocol", "wire", "engine", "server",
+    "_prelude", "core", "protocol", "media", "wire", "structured", "engine", "server",
     "selftest_a", "selftest_b", "cli",
 ]
 
@@ -72,7 +72,7 @@ def main(argv=None):
 
     with open(dest, "w", encoding="utf-8") as fh:
         fh.write(text)
-    print("wrote %s (%d bytes, %d lines)" % (dest, len(text), text.count("\n")))
+    print("wrote %s (%d bytes, %d lines)" % (dest, len(text.encode('utf-8')), text.count("\n")))
     print("verify with: python3 %s --selftest" % os.path.basename(dest))
     return 0
 

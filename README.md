@@ -2,7 +2,7 @@
 
 [![Tests](https://github.com/overwrite249-art/emulated-tool-calling/actions/workflows/tests.yml/badge.svg)](https://github.com/overwrite249-art/emulated-tool-calling/actions/workflows/tests.yml)
 
-**Tool calling for coding clients through a text-only, OpenAI-compatible model backend.**
+**Tool calling for coding clients through OpenAI-compatible backends, with optional image inputs.**
 
 emutools is a dependency-free Python 3.9+ proxy. It accepts Anthropic Messages or OpenAI
 Chat Completions, renders tool schemas into the prompt, and turns the model's text back
@@ -11,6 +11,7 @@ into native `tool_use` / `tool_calls` responses. It never sends a native `tools`
 - **Claude Code:** Anthropic Messages, including streaming and token counting.
 - **OpenAI-compatible clients:** Chat Completions, including streaming tool arguments and usage.
 - **MCP tools:** tools registered by the client are translated like other client tools; emutools is not itself an MCP server.
+- **Optional images:** forward user images and image-bearing tool results to a compatible vision model. Disabled by default.
 
 ## Quick start
 
@@ -80,16 +81,27 @@ Keep your coding client's tool permissions enabled.
   upstream streams produce protocol errors, not successful-looking assistant replies.
 - Literal `</tool_call>`, `<arg>` and DSML markup inside JSON arguments remain data rather
   than being mistaken for syntax or silently rewritten.
-- A fabricated `<tool_result>` discards the entire dependent continuation, including
-  additional calls that relied on a tool result which never existed.
+- Recognized fabricated `<tool_result>` output at protocol boundaries discards the
+  dependent continuation, including calls that relied on an observation which never existed.
 - Unterminated JSON strings are not invented. Bare JSON salvage is held back until it can
   be classified, avoiding visible JSON followed by a duplicate tool call.
+- Conflicting names or argument locations, duplicate JSON/XML declarations, and non-finite
+  literals are rejected instead of silently selecting an interpretation.
 - `tool_choice=none`, named tool choice, schema validation and call limits are enforced
   before calls reach clients—not merely requested in the model prompt.
 - Inbound request validation returns 400/413/408 for invalid, oversized or timed-out
   bodies. Chunked requests share the size limit and reject ambiguous/truncated framing.
 - Server instances use their own configuration. Model-map syntax matches the docs.
-- Anthropic streams report input usage; non-streaming repair attempts accumulate usage.
+- Anthropic streams report input usage; streamed and non-streaming repair attempts accumulate usage.
+- Streamed empty, rejected and nested-call responses receive bounded recovery without replaying delivered calls.
+- Malformed reserved text wrappers receive bounded recovery; ordinary prose is not turned into invented calls.
+- A narrow explicit-name/XML-parameter hybrid is recognized only at validated boundaries.
+- Optional JSON envelopes preserve arbitrary source strings and apply the same local tool-policy guards.
+- Opt-in image forwarding preserves image bytes rather than sending omission placeholders.
+- Actual call/result identifiers remain in history, including when parallel calls to the
+  same tool finish out of order. This applies to text results and image-bearing results.
+- Optional older-result text limits reduce retained observations without changing call
+  arguments, current-batch allowances, original canonical history, or loop-guard inputs.
 
 ## Endpoints
 
@@ -112,14 +124,46 @@ In particular, this is not a claim of Codex CLI compatibility.
 </tool_call>
 ```
 
-The parser also handles common tag aliases, raw XML-style arguments, single-quoted
-pseudo-JSON, trailing commas, Python literals, and missing structural closing tags.
-DeepSeek's fullwidth `｜｜DSML｜｜` markup is recognized at syntax boundaries without
-normalizing literal argument content.
+The default prompt requests this flat JSON format consistently. The parser also handles
+common tag aliases, raw XML-style arguments, single-quoted pseudo-JSON, trailing commas,
+Python literals, and some missing structural closing tags. DeepSeek's fullwidth
+`｜｜DSML｜｜` markup is recognized at syntax boundaries without normalizing literal argument
+content. Complete named JSON calls in bare DSML wrappers and a narrow observed hybrid
+format are also recognized. Arbitrary invented dialects are not guaranteed to work.
+
+See [text format, recovery boundaries and context controls](docs/text-protocol.md).
+Missing names, conflicting values and incomplete source strings are not guessed.
 
 **`EMU_USE_STOP` now defaults to `false`.** A literal `</tool_call>` stop sequence can cut
 file content mid-string. Opt in with `EMU_USE_STOP=true` only when that trade-off is
 acceptable; the missing close-tag recovery remains available.
+
+### Optional JSON response mode
+
+`EMU_JSON_OUTPUT=true` requests provider JSON-object output instead of the default text-tag
+format. This is still emulation: no native upstream tool definitions are sent. The full
+JSON envelope is buffered before releasing content or calls, so first-content latency is
+higher. A provider can still return empty or malformed content; local validation stays strict.
+
+See [JSON mode and generation controls](docs/json-output.md) for the contract, limitations,
+and `EMU_THINKING` / `EMU_REASONING_EFFORT` settings. JSON mode is opt-in, not a universal
+recommendation for every model or workload.
+
+### Optional image inputs
+
+```bash
+EMU_IMAGE_INPUTS=true EMU_PARALLEL=true EMU_THINKING=disabled \
+  EMU_MODEL_BIG=deepseek-v4-flash-vision-exp \
+  EMU_MODEL_SMALL=deepseek-v4-flash-vision-exp \
+  python3 -m emutools
+```
+
+Set the upstream key separately as in Quick start. **Both the opt-in flag and a compatible
+vision target are required.** Selecting a vision model alone does not enable forwarding.
+Image support does not enable native upstream tool calling or guarantee correct OCR.
+
+See [image inputs and their limits](docs/image-inputs.md) for supported formats, tool-result
+correlation, privacy, and bounded native-client checks.
 
 ## Tool policy and loop protection
 
@@ -131,9 +175,10 @@ With `EMU_PARALLEL=false`, at most one call is forwarded. With it enabled, the c
 per-turn cap applies; a client's `parallel_tool_calls=false` or Anthropic
 `disable_parallel_tool_use=true` can still disable parallel calls.
 
-Non-streaming rejected calls can be retried up to three times with corrective instructions
-when `EMU_LOOP_RETRY=true`. Invalid calls remain blocked after the last attempt. Streaming
-calls are validated before emission but are not silently re-run after partial output.
+Empty, malformed or rejected outputs can be retried up to three times with corrective
+instructions when `EMU_LOOP_RETRY=true`. Invalid calls remain blocked after the last attempt.
+Streaming recovery stops once a valid call has been emitted; a delivered call is never
+replayed to fix an invalid peer. Transport failures are not retried by that repair loop.
 An unsatisfied required/named tool choice returns a protocol error.
 
 Schema validation supports common recursive keywords: types, local `#/...` references,
@@ -141,6 +186,26 @@ properties/required/items, additional and pattern properties, enum/const, combin
 common numeric/string/array bounds, and unique items. It is a bounded **subset of JSON
 Schema**, not a complete validator; unsupported keywords and external references are not
 implemented. Client permissions remain the authority for executing tools.
+
+History labels connect prior calls and results by their actual identifiers, not by
+completion order. They are metadata, not new tool arguments. Metadata cannot force a
+model to reason correctly about an observation; check actual outputs independently.
+
+### Optional older-result limits
+
+```bash
+EMU_MAX_RESULT_CHARS=8192 EMU_HISTORY_RESULT_CHARS=512 python3 -m emutools
+```
+
+The history setting defaults to `0` (disabled). A positive value additionally shortens
+older tool-result text; the latest assistant tool-call batch keeps the normal per-result
+allowance, even when its results are split across messages or finish out of order. IDs,
+names, error status and image bytes remain intact. Omissions are marked, not replaced with
+invented summaries. Original history and call arguments are not mutated.
+
+This is lossy context management, not an aggregate token budget or a guaranteed model-quality
+improvement. Important older details may need targeted rereads. See the
+[text protocol guide](docs/text-protocol.md) for exact behavior and trade-offs.
 
 ## Configuration
 
@@ -157,13 +222,18 @@ implemented. Client permissions remain the authority for executing tools.
 | `EMU_MAX_CALLS_PER_TURN` | `4` | Cap when parallel calling is enabled |
 | `EMU_PARALLEL` | `false` | Otherwise enforce one call per turn |
 | `EMU_USE_STOP` | `false` | Opt-in closing-tag stop; can truncate literal code |
-| `EMU_LOOP_RETRY` | `true` | Bounded non-streaming corrective retries |
-| `EMU_SALVAGE` | `true` | Recover bare JSON calls |
-| `EMU_MAX_RESULT_CHARS` | `24000` | Middle-truncate long tool results |
-| `EMU_MAX_REQUEST_BYTES` | `16777216` | 16 MiB limit for length and chunked bodies |
+| `EMU_LOOP_RETRY` | `true` | Bounded streamed and non-streaming corrective retries |
+| `EMU_JSON_OUTPUT` | `false` | Opt-in provider JSON-object mode; whole-envelope buffering |
+| `EMU_IMAGE_INPUTS` | `false` | Opt-in image forwarding; requires a vision-capable upstream |
+| `EMU_THINKING` | empty | Explicit `enabled` / `disabled`; empty preserves provider default |
+| `EMU_REASONING_EFFORT` | empty | `low`, `medium`, `high`, `xhigh`, `max`; provider-dependent |
+| `EMU_SALVAGE` | `true` | Recover bare JSON calls; in JSON mode, narrowly recover surplus closing brackets |
+| `EMU_MAX_RESULT_CHARS` | `24000` | Text-only middle truncation; multimodal tool-result text prefix budget |
+| `EMU_HISTORY_RESULT_CHARS` | `0` | Additional older-result text cap; 0 disables, latest batch keeps normal allowance |
+| `EMU_MAX_REQUEST_BYTES` | `16777216` | 16 MiB limit for length and chunked bodies, including base64 images |
 | `EMU_CLIENT_TIMEOUT` | `30` | Client socket timeout in seconds |
 | `EMU_TIMEOUT` / `EMU_MAX_RETRIES` | `300` / `3` | Upstream timeout and connection attempts |
-| `EMU_LOG` / `EMU_LOG_BODIES` | `info` / `false` | Logging; body dumps can contain sensitive prompts |
+| `EMU_LOG` / `EMU_LOG_BODIES` | `info` / `false` | Logging; body dumps can contain sensitive prompts and images |
 
 ```bash
 EMU_MODEL_MAP='my-model=deepseek-v4-pro,tiny=deepseek-v4-flash' \
@@ -173,7 +243,7 @@ EMU_MODEL_MAP='my-model=deepseek-v4-pro,tiny=deepseek-v4-flash' \
 ## Tests and single-file deployment
 
 ```bash
-python3 -m unittest discover -s tests -v  # 53 regressions, including real sockets
+python3 -m unittest discover -s tests -v  # 213 regressions, including real sockets
 python3 -m emutools --selftest            # 200 built-in checks and parser fuzzing
 python3 build_single_file.py /tmp/emutools.py
 python3 /tmp/emutools.py --selftest       # same 200 checks, standalone
@@ -200,33 +270,65 @@ small output/turn limits, a wall-clock timeout and narrow tool permissions. The 
 is supplied only to the proxy, not to the CLI or its stdio MCP process. Live costs are
 not the same as a client's estimate for the advertised Claude alias.
 
-See [the September 2026 test report](docs/testing-2026-09-05.md) for observed results and
-limits, including the small VPS's inability to start OpenCode under memory pressure.
+### Bounded full-stack continuations
+
+The full-stack runner is also paid. Choose a spending limit deliberately and a fresh
+output directory. For an existing model-authored checkpoint:
+
+```bash
+python3 benchmarks/fullstack/run.py --cli "$(command -v claude)" \
+  --out-dir /tmp/emutools-fullstack-check \
+  --resume-app examples/claude-stockroom --compact-continuation \
+  --thinking disabled --max-output-tokens 2000 \
+  --max-result-chars 8192 --history-result-chars 512 --budget-usd 0.10
+```
+
+The compact mode keeps the full contract in `REQUIREMENTS.md`; it does not relax acceptance
+checks. The evaluator, seeded MCP tools and conservative financial reservation guard are
+unchanged. A reservation can reject a new request even when completed-request charges are
+below the limit. That is not proof of provider-account depletion.
+
+The small smoke test passed with the real model, but **the harder full-stack challenge
+has not passed**. The inventory checkpoint is not production-ready. Read the dated
+[smoke-test report](docs/testing-2026-09-05.md),
+[full-stack/vision baseline](docs/fullstack-and-vision-2026-09-06.md),
+[image-forwarding follow-up](docs/vision-and-correlation-2026-09-07.md), and
+[text-tool hardening and live results](docs/text-tool-hardening-2026-09-07.md).
+The latest text continuations still made no app-source repairs. Live OpenCode testing on
+the small VPS was blocked by memory pressure; deterministic real-client CI is a separate result.
 
 ## Layout
 
 | Path | Contents |
 | --- | --- |
-| `emutools/core.py` | Configuration, canonical types, utilities |
+| `emutools/core.py` | Configuration, canonical types, utilities and rendering-only history limits |
 | `emutools/protocol.py` | Prompts, tolerant parsing, incremental tool parser, validation |
+| `emutools/media.py` | Opt-in image normalization, validation and correlated result rendering |
 | `emutools/wire.py` | Loop state, upstream HTTP/SSE, request translation |
+| `emutools/structured.py` | Opt-in strict JSON envelopes and consistent tool history |
 | `emutools/engine.py` | Policy enforcement, turns and response serialization |
 | `emutools/server.py` | HTTP framing, routes, request validation |
 | `emutools/selftest_*.py` | 200-check built-in suite |
 | `tests/` | Focused regressions and real-socket tests |
 | `scripts/live_cli_smoke.py` | Opt-in real-model or deterministic-model CLI test |
 | `scripts/cli_mock_upstream.py` | Deterministic model for real-client CI |
+| `benchmarks/fullstack/` | Seeded SQLite/MCP challenge, bounded paid runner, independent acceptance and concurrency checks |
+| `benchmarks/vision/` | Separate direct-provider, proxy-HTTP and actual native-client image checks |
+| `examples/claude-stockroom/` | Model-authored checkpoint; read its provenance and known limitations before use |
 | `build_single_file.py` | Standalone distribution builder |
 
 ## Remaining limitations
 
 - Emulation adds prompt tokens and depends on the model following a text protocol.
 - Validation and repair are defensive heuristics, not a guarantee that a tool call is safe.
-- Images, documents and audio are replaced with text placeholders; this is a text-only bridge.
-- Token counting is approximate when the upstream does not report usage.
+- Optional older-result clipping can remove details the model later needs; it is not an exact token budget.
+- Image forwarding is opt-in and upstream-dependent. Documents/audio and unsupported image source types are not implemented.
+- System/assistant image inputs are not forwarded. Provider Files API references are not supported.
+- Token counting is approximate, especially for multimodal input; do not use it as exact image billing or admission control.
 - Raw XML argument form cannot unambiguously represent its own argument-closing delimiter;
   JSON is preferable for arbitrary source code.
 - No Responses API, native upstream tool-call streaming, or authenticated public serving.
+- A client exiting with code zero does not prove a model completed its task. The benchmark checks actual tool activity and independent outcomes.
 
 ## License
 

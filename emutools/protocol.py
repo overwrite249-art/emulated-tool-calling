@@ -8,20 +8,18 @@ from .core import *  # noqa: F401,F403
 _PROTOCOL_HEADER = """\
 # Tool calling protocol
 
-You have access to tools. There is no native tool-calling channel here: you invoke a
-tool by writing a plain-text block into your reply, and the runtime executes it for you.
-
-Do NOT use your own built-in tool-call markup, function-call channel, or any special
-sentinel tokens. Only the exact `<tool_call>` block described below is read by the
-runtime; any other tool-call syntax is treated as plain text and discarded.
+You have access to tools. There is no native tool-calling channel here: write
+plain-text JSON call blocks and the runtime executes the validated calls for you.
+Use ONE format consistently. Do not emit native sentinel tokens, DSML, nested
+call wrappers, XML argument tags, or tags named after a tool.
 
 ## Available tools
 
 {tools_block}
 
-## How to invoke a tool
+## How to invoke tools
 
-Emit exactly this, and nothing after it:
+For each call, emit one flat block:
 
 <tool_call>
 {{"name": "TOOL_NAME", "arguments": {{"arg": "value"}}}}
@@ -29,38 +27,29 @@ Emit exactly this, and nothing after it:
 
 Hard rules:
 
-1. The block body MUST be a single JSON object with exactly two keys: "name" and "arguments".
-   "arguments" is always an object, even when empty: {{"name": "Ping", "arguments": {{}}}}
-2. STOP generating immediately after `</tool_call>`. Write nothing after it.
-3. NEVER write a `<tool_result>` block yourself. NEVER invent, guess, predict or
-   describe what a tool returned. The runtime executes the tool and sends you the real
-   result in the next message. Text you invent is a hallucination and will be discarded.
-4. Use only the tool names listed above, spelled exactly. Do not invent tools.
-5. Supply every required parameter, with the declared JSON types (a number is `3`,
-   not `"3"`; a boolean is `true`, not `"true"`).
-6. If you do not need a tool, just answer normally in prose with no block at all.
-7. Never place a tool call inside a markdown code fence.
-
-## Raw form for awkward strings
-
-If an argument contains source code, newlines, backslashes or quotes that are painful to
-JSON-escape, use the raw form instead - no escaping is needed inside it:
-
-<tool_call name="TOOL_NAME">
-<arg name="file_path">/tmp/demo.py</arg>
-<arg name="content">
-print("hello \\ \"world\"")
-</arg>
-</tool_call>
+1. Each block body MUST be one JSON object with exactly two keys: "name" and
+   "arguments". Arguments are always an object, even when empty:
+   {{"name": "Ping", "arguments": {{}}}}
+2. Stop generating after the last tool-call block, not after the first block of
+   an allowed independent batch. The call-count rule below determines whether
+   you may emit one call or several. Do not include trailing commentary.
+3. NEVER write a `<tool_result>` yourself. Never invent, predict, or describe a
+   result before execution. The runtime supplies actual results in the next message.
+4. Use exact declared tool names and parameter names. Supply every required
+   parameter with its declared JSON type. Never infer results from a call's position.
+5. JSON-escape source strings, including newlines, quotes and backslashes. Keep
+   their actual content unchanged. Do not switch to an XML/raw argument format.
+6. If you do not need a tool, answer normally in prose without any call block.
+7. Never put a tool call in a Markdown code fence. Prior history_id labels describe
+   old calls and results; do not copy those labels into new call syntax.
 
 ## Avoiding loops
 
-- Before calling a tool, check whether an earlier `<tool_result>` in this conversation
-  already answers the question. If it does, reuse it instead of calling again.
-- Never repeat a call you have already made with identical arguments.
-- If a tool keeps failing, change your approach or explain the problem to the user.
-  Do not retry the same call over and over.
-- Prefer the smallest number of calls that gets the job done, then answer.
+- Reuse a previous actual result when it already answers the question.
+- Never repeat a call with identical arguments without a concrete reason.
+- If a tool fails, inspect the real error and change your approach or explain it.
+- Prefer short, targeted reads and the smallest number of calls that gets the job done.
+- Finish the requested work and verify real outcomes before claiming success.
 """
 
 _ONE_CALL_RULE = (
@@ -293,19 +282,50 @@ def _extract_first_object(s: str) -> Optional[str]:
     return None
 
 
-def loads_tolerant(text: str) -> Tuple[Optional[Any], bool]:
-    """Parse JSON, repairing common LLM mistakes.
+class _UnsafeLiteral(ValueError):
+    """An ambiguity or non-JSON value must never fall through to a repair."""
 
-    Returns (value, repaired). value is None when unrecoverable.
+
+def _unique_json_object(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    value: Dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise _UnsafeLiteral("duplicate object key")
+        value[key] = item
+    return value
+
+
+def _finite_json_float(raw: str) -> float:
+    value = float(raw)
+    if not math.isfinite(value):
+        raise _UnsafeLiteral("non-finite number")
+    return value
+
+
+def _invalid_json_constant(raw: str) -> Any:
+    raise _UnsafeLiteral("non-finite constant")
+
+
+def _safe_literal_json(text: str) -> Any:
+    return json.loads(text, object_pairs_hook=_unique_json_object,
+                      parse_float=_finite_json_float, parse_constant=_invalid_json_constant)
+
+
+def loads_tolerant(text: str) -> Tuple[Optional[Any], bool]:
+    """Repair syntax, never duplicate fields or non-finite literal values.
+
+    Returns (value, repaired). value is None when unrecoverable. String values
+    are data: duplicate-looking source text inside a string is not inspected.
     """
     if text is None:
         return None, False
     s = strip_fences(str(text))
     if not s.strip():
         return None, False
-
     try:
-        return json.loads(s), False
+        return _safe_literal_json(s), False
+    except _UnsafeLiteral:
+        return None, False
     except ValueError:
         pass
 
@@ -314,7 +334,6 @@ def loads_tolerant(text: str) -> Tuple[Optional[Any], bool]:
     if obj:
         candidates.append(obj)
     candidates.append(s)
-
     for cand in candidates:
         for transform in (
             lambda x: x,
@@ -330,17 +349,30 @@ def loads_tolerant(text: str) -> Tuple[Optional[Any], bool]:
             except Exception:  # noqa: BLE001 - repair must never explode
                 continue
             try:
-                return json.loads(fixed), True
+                return _safe_literal_json(fixed), True
+            except _UnsafeLiteral:
+                return None, False
             except ValueError:
                 continue
 
-    # Last resort: single-quoted pseudo-JSON.
+    # Single-quoted pseudo-JSON also needs duplicate checks BEFORE literal_eval
+    # collapses dictionary entries. No code is executed by literal_eval.
     try:
         import ast
-
-        val = ast.literal_eval(s if not obj else obj)
+        tree = ast.parse(s if not obj else obj, mode="eval")
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Dict):
+                seen = set()
+                for key_node in node.keys:
+                    key = ast.literal_eval(key_node)
+                    if not isinstance(key, str) or key in seen:
+                        raise _UnsafeLiteral("duplicate or non-string object key")
+                    seen.add(key)
+            if isinstance(node, ast.Constant) and isinstance(node.value, float) and not math.isfinite(node.value):
+                raise _UnsafeLiteral("non-finite number")
+        val = ast.literal_eval(tree)
         if isinstance(val, (dict, list)):
-            return json.loads(json.dumps(val, default=str)), True
+            return _safe_literal_json(json.dumps(val, default=str, allow_nan=False)), True
     except Exception:  # noqa: BLE001
         pass
     return None, False
@@ -359,6 +391,11 @@ OPEN_TAG_NAMES = [
     "tool_use",
     "antml:invoke",
     "invoke",
+    # Bare vendor wrappers still require an explicitly named call in their body.
+    "｜｜dsml｜｜",
+    "||dsml||",
+    "｜dsml｜",
+    "|dsml|",
 ]
 
 _TAGS_ALT = "|".join(re.escape(t) for t in OPEN_TAG_NAMES)
@@ -432,6 +469,9 @@ _MAX_SENTINEL = max(len(s) for s in STREAM_SENTINELS)
 _FENCE_TAIL_RE = re.compile(r"(?:^|\n)`{1,3}[a-zA-Z0-9_+-]*[ \t]*\n?$")
 
 
+_ATTR_CONFLICT = "__emutools_duplicate_attribute__"
+
+
 def _parse_attrs(raw: Optional[str]) -> Dict[str, str]:
     out: Dict[str, str] = {}
     if not raw:
@@ -439,17 +479,63 @@ def _parse_attrs(raw: Optional[str]) -> Dict[str, str]:
     for m in _ATTR_RE.finditer(raw):
         key = m.group(1).lower()
         val = m.group(3) if m.group(3) is not None else (m.group(4) or "")
+        if key in out:
+            out[_ATTR_CONFLICT] = "true"
         out[key] = val
     return out
 
 
+# Observed legacy hybrid: {"name": "Read"> followed ONLY by named raw args.
+# This is a narrowly recognized grammar, not a general JSON punctuation repair.
+_HYBRID_HEADER_RE = re.compile(r'\A\s*\{\s*"name"\s*:\s*("(?:[^"\\]|\\.){1,1024}")\s*>\s*', re.DOTALL)
+
+
+def _hybrid_body(body: str) -> Optional[Tuple[str, str]]:
+    body = strip_fences(body)
+    header = _HYBRID_HEADER_RE.match(body)
+    if not header:
+        return None
+    try:
+        name = json.loads(header.group(1))
+    except ValueError:
+        return None
+    if not isinstance(name, str) or not name:
+        return None
+    arguments = body[header.end():]
+    matches = list(_ARG_RE.finditer(arguments))
+    if not matches:
+        return None
+    cursor = 0
+    seen = set()
+    for match in matches:
+        if arguments[cursor:match.start()].strip():
+            return None
+        attrs = _parse_attrs(match.group(2))
+        keys = [attrs[k] for k in ("name", "key") if attrs.get(k)]
+        if attrs.get(_ATTR_CONFLICT) or not keys or len(set(keys)) != 1 or keys[0] in seen:
+            return None
+        seen.add(keys[0])
+        cursor = match.end()
+    if arguments[cursor:].strip():
+        return None
+    return name, arguments
+
+
 def _find_close(text: str, tag: str, start: int) -> Tuple[int, int]:
     """Find syntax, not a closing tag embedded in JSON or raw argument data."""
-    close_re = re.compile(r"</\s*" + _VENDOR + re.escape(tag) + r"\s*>", re.IGNORECASE)
     body = strip_fences(text[start:]).lstrip()
-    is_json = body.startswith(("{", "["))
+    hybrid = bool(_HYBRID_HEADER_RE.match(body))
+    endings = "(?:" + re.escape(tag) + "|invoke|tool_call)" if hybrid else re.escape(tag)
+    close_re = re.compile(r"</\s*" + _VENDOR + endings + r"\s*>", re.IGNORECASE)
+    is_json = body.startswith(("{", "[")) and not hybrid
     for match in close_re.finditer(text, start):
         segment = text[start:match.start()]
+        if hybrid:
+            # An alternate closer is a boundary only after the entire explicit
+            # argument list. Markup inside an argument cannot terminate a call.
+            if _hybrid_body(segment):
+                return match.start(), match.end()
+            continue
         if is_json:
             quote = ""
             escaped = False
@@ -653,14 +739,15 @@ def _build_call(
         return None
     resolved = name
     if resolved not in tools_by_name:
-        lowered = {k.lower(): k for k in tools_by_name}
-        if resolved.lower() in lowered:
-            resolved = lowered[resolved.lower()]
-        else:
+        lowered = [k for k in tools_by_name if k.lower() == resolved.lower()]
+        if len(lowered) == 1:
+            resolved = lowered[0]
+        elif not lowered:
             stripped = re.sub(r"[^A-Za-z0-9_]", "", resolved).lower()
-            alt = {re.sub(r"[^A-Za-z0-9_]", "", k).lower(): k for k in tools_by_name}
-            if stripped in alt:
-                resolved = alt[stripped]
+            alternatives = [k for k in tools_by_name
+                            if re.sub(r"[^A-Za-z0-9_]", "", k).lower() == stripped]
+            if len(alternatives) == 1:
+                resolved = alternatives[0]
     if not isinstance(args, dict):
         args = {} if args is None else {"value": args}
     tdef = tools_by_name.get(resolved)
@@ -674,20 +761,35 @@ def parse_call_body(
     attrs: Dict[str, str],
     tools_by_name: Dict[str, ToolDef],
 ) -> Optional[ToolCall]:
-    """Turn the inside of a <tool_call> block into a ToolCall."""
+    """Decode one call without selecting between conflicting declarations."""
     raw = body
     body = strip_fences(body)
-    name = attrs.get("name") or attrs.get("tool") or attrs.get("function") or ""
+    if attrs.get(_ATTR_CONFLICT):
+        return None
+    outer_names = [attrs[k] for k in ("name", "tool", "function") if attrs.get(k)]
+    if len(set(outer_names)) > 1:
+        return None
+    name = outer_names[0] if outer_names else ""
+    hybrid = _hybrid_body(body)
+    if hybrid:
+        hybrid_name, arguments = hybrid
+        if hybrid_name not in tools_by_name or name and name != hybrid_name:
+            return None
+        name, body = hybrid_name, arguments
 
-    # Raw <arg name="...">...</arg> form.
     arg_matches = [] if body.lstrip().startswith(("{", "[")) else list(_ARG_RE.finditer(body))
     if arg_matches:
         args: Dict[str, Any] = {}
         for m in arg_matches:
             a_attrs = _parse_attrs(m.group(2))
-            key = a_attrs.get("name") or a_attrs.get("key")
+            keys = [a_attrs[k] for k in ("name", "key") if a_attrs.get(k)]
+            if a_attrs.get(_ATTR_CONFLICT) or len(set(keys)) > 1:
+                return None
+            key = keys[0] if keys else ""
             if not key:
                 continue
+            if key in args:
+                return None
             val = m.group(3)
             if val.startswith("\n"):
                 val = val[1:]
@@ -695,59 +797,68 @@ def parse_call_body(
                 val = val[:-1]
             args[key] = val
         if not name:
-            leading = body[: arg_matches[0].start()].strip()
+            leading = body[:arg_matches[0].start()].strip()
             parsed, _ = loads_tolerant(leading)
             if isinstance(parsed, dict):
                 name = safe_str(parsed.get("name"))
             if not name and leading and "\n" not in leading and len(leading) < 80:
+                if leading.startswith(("{", "[")):
+                    return None
                 name = leading.strip().strip("\"'")
         if name:
             return _build_call(name, args, raw, True, tools_by_name)
 
     parsed, repaired = loads_tolerant(body)
     if isinstance(parsed, dict):
-        pname = ""
-        for key in ("name", "tool", "tool_name", "function", "function_name", "recipient_name"):
-            if isinstance(parsed.get(key), str) and parsed.get(key):
-                pname = parsed[key]
-                break
-        if not pname and isinstance(parsed.get("function"), dict):
-            pname = safe_str(parsed["function"].get("name"))
-        pargs: Any = None
-        for key in ("arguments", "input", "parameters", "args", "parameter_values"):
-            if key in parsed:
-                pargs = parsed[key]
-                break
-        if pargs is None and isinstance(parsed.get("function"), dict):
-            pargs = parsed["function"].get("arguments")
-        if isinstance(pargs, str):
-            reparsed, rep2 = loads_tolerant(pargs)
-            if isinstance(reparsed, dict):
-                pargs = reparsed
-                repaired = repaired or rep2
-            else:
-                pargs = {"value": pargs}
-        if pargs is None:
-            if name or pname:
-                leftovers = {
-                    k: v
-                    for k, v in parsed.items()
-                    if k
-                    not in (
-                        "name",
-                        "tool",
-                        "tool_name",
-                        "function",
-                        "function_name",
-                        "recipient_name",
-                        "type",
-                        "id",
-                    )
-                }
-                pargs = leftovers
-            else:
-                pargs = {}
-        final_name = pname or name
+        name_keys = ("name", "tool", "tool_name", "function", "function_name", "recipient_name")
+        argument_keys = ("arguments", "input", "parameters", "args", "parameter_values")
+        nested = parsed.get("function") if isinstance(parsed.get("function"), dict) else None
+        names = list(outer_names)
+        for key in name_keys:
+            if key not in parsed or key == "function" and nested is not None:
+                continue
+            if not isinstance(parsed[key], str) or not parsed[key]:
+                return None
+            names.append(parsed[key])
+        if nested is not None:
+            if set(nested) - set(("name", "id", "type") + argument_keys):
+                return None
+            if "name" in nested:
+                if not isinstance(nested["name"], str) or not nested["name"]:
+                    return None
+                names.append(nested["name"])
+        if len(set(names)) > 1:
+            return None
+        final_name = names[0] if names else ""
+
+        values = [parsed[k] for k in argument_keys if k in parsed]
+        if nested is not None:
+            values.extend(nested[k] for k in argument_keys if k in nested)
+        if values:
+            # Wrapped arguments plus extra flat arguments are ambiguous even
+            # when one interpretation happens to satisfy a tool's schema.
+            allowed = set(name_keys + argument_keys + ("type", "id"))
+            if set(parsed) - allowed:
+                return None
+            normalized = []
+            for value in values:
+                if value is None:
+                    return None
+                if isinstance(value, str):
+                    decoded, rep2 = loads_tolerant(value)
+                    if isinstance(decoded, dict):
+                        value = decoded
+                        repaired = repaired or rep2
+                    elif value.lstrip().startswith(("{", "[")):
+                        return None
+                    else:
+                        value = {"value": value}
+                normalized.append(value)
+            if any(canon_json(value) != canon_json(normalized[0]) for value in normalized[1:]):
+                return None
+            pargs = normalized[0]
+        else:
+            pargs = {k: v for k, v in parsed.items() if k not in name_keys + ("type", "id")}
         if final_name:
             return _build_call(final_name, pargs, raw, repaired, tools_by_name)
 
@@ -765,6 +876,16 @@ def strip_hallucinated_results(text: str) -> str:
 
 def _clean_trailing_fence(text: str) -> str:
     return re.sub(r"(?:^|\n)`{3}[a-zA-Z0-9_+-]*[ \t]*\n?\s*$", "\n", text)
+
+
+_NESTED_CLOSE_RE = re.compile(r"</tool_call\s*>", re.IGNORECASE)
+STREAM_SENTINELS.append("</tool_call")
+
+
+def _anonymous_call_wrapper(tag: str, attrs: Dict[str, str], tail: str) -> bool:
+    # A JSON body is an actual call, never a container. Only a child opener
+    # immediately inside an anonymous canonical tag is safe to unwrap.
+    return tag.lower() == "tool_call" and not attrs and bool(_OPEN_RE.match(tail.lstrip()))
 
 
 def extract_tool_calls(
@@ -790,19 +911,33 @@ def extract_tool_calls(
     calls: List[ToolCall] = []
     out_parts: List[str] = []
     pos = 0
+    wrapper_depth = 0
 
     while True:
         m = _OPEN_RE.search(text, pos)
         result = re.search(r"<" + _VENDOR + r"tool_result\b[^>]*>", text[pos:], re.IGNORECASE)
-        if result and (not m or pos + result.start() < m.start()):
+        closing = _NESTED_CLOSE_RE.search(text, pos) if wrapper_depth else None
+        boundary = min(m.start() if m else len(text), closing.start() if closing else len(text))
+        if result and pos + result.start() < boundary:
             # Everything after a fabricated result depends on a tool that never ran.
             out_parts.append(text[pos:pos + result.start()])
             break
+        if closing and (not m or closing.start() < m.start()):
+            out_parts.append(text[pos:closing.start()])
+            pos = closing.end()
+            wrapper_depth -= 1
+            continue
         if not m:
             out_parts.append(text[pos:])
             break
         tag = m.group(1)
         attrs = _parse_attrs(m.group(2))
+        if (wrapper_depth < 16 and not m.group(0).rstrip().endswith("/>")
+                and _anonymous_call_wrapper(tag, attrs, text[m.end():])):
+            out_parts.append(text[pos:m.start()])
+            pos = m.end()
+            wrapper_depth += 1
+            continue
         # Self-closing tag with everything in attributes.
         if m.group(0).rstrip().endswith("/>"):
             out_parts.append(text[pos : m.start()])
@@ -880,6 +1015,7 @@ class StreamToolParser:
         self.text_emitted = ""
         self.saw_any_call = False
         self.discard_rest = False
+        self.wrapper_depth = 0
 
     @staticmethod
     def _holdback_len(buf: str) -> int:
@@ -915,6 +1051,12 @@ class StreamToolParser:
 
         while True:
             if self.in_call:
+                if (self.wrapper_depth < 16
+                        and _anonymous_call_wrapper(self.call_tag, self.call_attrs, self.buf)):
+                    self.in_call = False
+                    self.call_buf = ""
+                    self.wrapper_depth += 1
+                    continue
                 c_start, c_end = _find_close(self.buf, self.call_tag, 0)
                 if c_start < 0:
                     self.call_buf = self.buf
@@ -931,7 +1073,9 @@ class StreamToolParser:
 
             m = _OPEN_RE.search(self.buf)
             result = re.search(r"<" + _VENDOR + r"tool_result\b[^>]*>", self.buf, re.IGNORECASE)
-            if result and (not m or result.start() < m.start()):
+            closing = _NESTED_CLOSE_RE.search(self.buf) if self.wrapper_depth else None
+            boundary = min(m.start() if m else len(self.buf), closing.start() if closing else len(self.buf))
+            if result and result.start() < boundary:
                 head = _WRAPPER_RE.sub("", self.buf[:result.start()])
                 if head:
                     out.append(head)
@@ -939,6 +1083,14 @@ class StreamToolParser:
                 self.buf = ""
                 self.discard_rest = True
                 break
+            if closing and (not m or closing.start() < m.start()):
+                head = _WRAPPER_RE.sub("", self.buf[:closing.start()])
+                if head:
+                    out.append(head)
+                    self.text_emitted += head
+                self.buf = self.buf[closing.end():]
+                self.wrapper_depth -= 1
+                continue
             if m:
                 head = _WRAPPER_RE.sub("", self.buf[: m.start()])
                 if self.saw_any_call is False and not self.calls:

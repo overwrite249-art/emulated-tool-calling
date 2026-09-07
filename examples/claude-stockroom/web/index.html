@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Stockroom</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Stockroom</h1>
+    <span class="subtitle">Inventory dashboard</span>
+  </header>
+
+  <main>
+    <section class="cards" aria-label="Summary">
+      <div class="card" id="card-products">
+        <div class="card-label">Active products</div>
+        <div class="card-value">&ndash;</div>
+      </div>
+      <div class="card" id="card-units">
+        <div class="card-label">Available units</div>
+        <div class="card-value">&ndash;</div>
+      </div>
+      <div class="card" id="card-value">
+        <div class="card-label">Inventory value</div>
+        <div class="card-value">&ndash;</div>
+      </div>
+      <div class="card" id="card-low">
+        <div class="card-label">Low stock rows</div>
+        <div class="card-value">&ndash;</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Inventory</h2>
+      <div class="controls">
+        <div class="field">
+          <label for="search">Search SKU / name</label>
+          <input id="search" type="search" placeholder="Search&hellip;" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="warehouse-filter">Warehouse</label>
+          <select id="warehouse-filter">
+            <option value="">All warehouses</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="table-scroll" id="table-scroll" tabindex="0">
+        <table id="inventory-table">
+          <thead>
+            <tr>
+              <th>SKU</th><th>Name</th><th>Warehouse</th><th>On hand</th>
+              <th>Reserved</th><th>Available</th><th>Price</th><th>Reorder</th>
+            </tr>
+          </thead>
+          <tbody id="inventory-body">
+            <tr><td colspan="8" class="empty">Loading&hellip;</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="pager">
+        <button id="prev-page" type="button" disabled>Previous</button>
+        <span id="page-info" class="muted"></span>
+        <button id="next-page" type="button" disabled>Next</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Transfer stock</h2>
+      <form id="transfer-form" novalidate>
+        <div class="field">
+          <label for="tf-product">Product ID</label>
+          <input id="tf-product" type="number" min="1" step="1" inputmode="numeric">
+        </div>
+        <div class="field">
+          <label for="tf-from">From warehouse</label>
+          <select id="tf-from"></select>
+        </div>
+        <div class="field">
+          <label for="tf-to">To warehouse</label>
+          <select id="tf-to"></select>
+        </div>
+        <div class="field">
+          <label for="tf-qty">Quantity</label>
+          <input id="tf-qty" type="number" min="1" step="1" inputmode="numeric">
+        </div>
+        <div class="field">
+          <label for="tf-key">Idempotency key</label>
+          <input id="tf-key" type="text" maxlength="128" placeholder="unique key">
+        </div>
+        <button id="tf-submit" type="submit">Transfer</button>
+        <p id="transfer-msg" class="form-msg" role="status"></p>
+      </form>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -70,7 +70,12 @@ class Config:
     use_stop: bool = field(default_factory=lambda: _env_bool("EMU_USE_STOP", False))
     merge_roles: bool = field(default_factory=lambda: _env_bool("EMU_MERGE_ROLES", True))
     salvage_bare_json: bool = field(default_factory=lambda: _env_bool("EMU_SALVAGE", True))
+    json_output: bool = field(default_factory=lambda: _env_bool("EMU_JSON_OUTPUT", False))
+    # Explicit opt-in: the configured upstream must accept image_url content parts.
+    image_inputs: bool = field(default_factory=lambda: _env_bool("EMU_IMAGE_INPUTS", False))
     max_result_chars: int = field(default_factory=lambda: _env_int("EMU_MAX_RESULT_CHARS", 24000))
+    # Zero preserves existing behavior; positive values cap only older results.
+    history_result_chars: int = field(default_factory=lambda: _env_int("EMU_HISTORY_RESULT_CHARS", 0))
 
     # Inbound HTTP resource limits (the server is intended for loopback use).
     max_request_bytes: int = field(default_factory=lambda: _env_int("EMU_MAX_REQUEST_BYTES", 16 * 1024 * 1024))
@@ -82,6 +87,18 @@ class Config:
 
     log_level: str = field(default_factory=lambda: _env("EMU_LOG", "info").lower())
     log_bodies: bool = field(default_factory=lambda: _env_bool("EMU_LOG_BODIES", False))
+
+    # Opt-in provider settings; empty values preserve generic upstream behavior.
+    thinking: str = field(default_factory=lambda: _env("EMU_THINKING", "").strip().lower())
+    reasoning_effort: str = field(default_factory=lambda: _env("EMU_REASONING_EFFORT", "").strip().lower())
+
+    def __post_init__(self) -> None:
+        if type(self.history_result_chars) is not int or self.history_result_chars < 0:
+            raise ValueError("EMU_HISTORY_RESULT_CHARS must be a non-negative integer")
+        if self.thinking not in ("", "enabled", "disabled"):
+            raise ValueError("EMU_THINKING must be enabled, disabled, or empty")
+        if self.reasoning_effort not in ("", "low", "medium", "high", "xhigh", "max"):
+            raise ValueError("EMU_REASONING_EFFORT must be low, medium, high, xhigh, max, or empty")
 
     def model_map(self) -> Dict[str, str]:
         if not self.model_map_raw.strip():
@@ -253,6 +270,8 @@ class CanonMessage:
     tool_calls: List[ToolCall] = field(default_factory=list)
     # tool results attached to a user turn: (tool_use_id, name, content, is_error)
     tool_results: List[Tuple[str, str, str, bool]] = field(default_factory=list)
+    # Ordered text/image parts, including correlated image-bearing tool results.
+    content_parts: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -269,6 +288,26 @@ class CanonRequest:
     stream: bool = False
     parallel_tool_calls: Optional[bool] = None
     protocol: str = "anthropic"  # anthropic | openai
+
+
+def result_configs(req: CanonRequest, cfg: Config) -> List[Config]:
+    """Rendering-only limits; never mutate requests, call arguments or guard inputs.
+
+    Keep the latest assistant tool-call batch at the normal per-result limit,
+    including results split across messages or returned in reverse order.
+    Without an explicit call boundary, do not guess which results are older.
+    """
+    if cfg.history_result_chars == 0:
+        return [cfg] * len(req.messages)
+    boundary = max((i for i, msg in enumerate(req.messages)
+                    if msg.role == "assistant" and msg.tool_calls), default=0)
+    if not boundary:
+        return [cfg] * len(req.messages)
+    from dataclasses import replace
+    limit = (min(cfg.max_result_chars, cfg.history_result_chars)
+             if cfg.max_result_chars > 0 else cfg.history_result_chars)
+    old = replace(cfg, max_result_chars=limit)
+    return [old if i < boundary else cfg for i in range(len(req.messages))]
 
 
 # ======================================================================================
@@ -310,9 +349,11 @@ __all__ = [
     "ToolCall",
     "CanonMessage",
     "CanonRequest",
+    "result_configs",
     "CALL_OPEN",
     "CALL_CLOSE",
     "RESULT_OPEN",
     "RESULT_CLOSE",
 ]
 # --- end generated header ---
+
