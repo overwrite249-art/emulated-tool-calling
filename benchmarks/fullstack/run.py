@@ -77,7 +77,8 @@ def analyze(work):
 
 def proxy_settings(args):
     settings={'EMU_JSON_OUTPUT':'true' if args.json_output else 'false',
-              'EMU_MAX_RESULT_CHARS':str(args.max_result_chars)}
+              'EMU_MAX_RESULT_CHARS':str(args.max_result_chars),
+              'EMU_HISTORY_RESULT_CHARS':str(getattr(args,'history_result_chars',0))}
     if args.thinking:settings['EMU_THINKING']=args.thinking
     if args.reasoning_effort:settings['EMU_REASONING_EFFORT']=args.reasoning_effort
     return settings
@@ -103,12 +104,14 @@ def main():
     ap.add_argument('--thinking',choices=('enabled','disabled'),help='Explicit upstream thinking mode; omitted keeps the provider default')
     ap.add_argument('--max-output-tokens',type=int,default=6000,help='Per-response output allowance, 1..6000')
     ap.add_argument('--max-result-chars',type=int,default=24000,help='Per-tool-result text budget, 1..24000; truncation markers add overhead')
+    ap.add_argument('--history-result-chars',type=int,default=0,help='Older-result text budget, 0..24000; 0 disables it, latest batch keeps --max-result-chars')
     ap.add_argument('--focus',default='',help='Additional reviewer feedback for a focused continuation')
     ap.add_argument('--json-output',action='store_true',help='Use opt-in provider JSON response mode')
     ap.add_argument('--reasoning-effort',choices=('low','medium','high','xhigh','max'),help='Explicit upstream reasoning effort')
     a=ap.parse_args();key=os.environ.get('EMU_UPSTREAM_API_KEY') or os.environ.get('DEEPSEEK_API_KEY')
     if not 1<=a.max_output_tokens<=6000:ap.error('--max-output-tokens must be between 1 and 6000')
     if not 1<=a.max_result_chars<=24000:ap.error('--max-result-chars must be between 1 and 24000')
+    if not 0<=a.history_result_chars<=24000:ap.error('--history-result-chars must be between 0 and 24000')
     if a.compact_continuation and not a.resume_app:ap.error('--compact-continuation requires --resume-app')
     if not key:ap.error('set EMU_UPSTREAM_API_KEY; this test makes paid requests')
     work=Path(a.out_dir).resolve();work.mkdir(parents=True,exist_ok=False);app=work/'app';app.mkdir();home=work/'home';home.mkdir()
@@ -140,7 +143,7 @@ def main():
              '--max-turns','30','--max-budget-usd','2.00','--system-prompt',
              'You are performing a real coding integration test. Implement the app, use the available tools, and verify actual outcomes. Work only in the provided app workspace. Never edit evaluator files or emutools. Keep output concise. Use independent tool calls in batches when safe. Do not install packages or access external services. Do not claim success without passing commands.',
              client_task(spec,a)+'\nUse port '+str(app_port)+' for your server. To run the independent verifier: python3 '+str(HERE/'verify.py')+' --app '+str(app)+' --out-dir '+str(app/'acceptance-1')+'. Use a NEW output directory (acceptance-2 etc.) on each repeat. Fix failures before finishing.']
-    proxy=client=None;start=time.monotonic();result={'model':'deepseek-v4-pro','parallel_enabled':True,'max_calls_per_turn':4,'resumed_source_files':resumed,'thinking_mode':a.thinking or 'provider_default','output_token_limit':a.max_output_tokens,'result_text_limit':a.max_result_chars,'compact_continuation':a.compact_continuation,'reviewer_feedback_supplied':bool(a.focus),'json_output':a.json_output,'reasoning_effort':a.reasoning_effort or 'provider_default'}
+    proxy=client=None;start=time.monotonic();result={'model':'deepseek-v4-pro','parallel_enabled':True,'max_calls_per_turn':4,'resumed_source_files':resumed,'thinking_mode':a.thinking or 'provider_default','output_token_limit':a.max_output_tokens,'result_text_limit':a.max_result_chars,'historical_result_text_limit':a.history_result_chars,'compact_continuation':a.compact_continuation,'reviewer_feedback_supplied':bool(a.focus),'json_output':a.json_output,'reasoning_effort':a.reasoning_effort or 'provider_default'}
     try:
         with (work/'proxy.log').open('w') as log:
             proxy=subprocess.Popen([sys.executable,'-m','emutools'],cwd=REPO,env=proxy_env,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
