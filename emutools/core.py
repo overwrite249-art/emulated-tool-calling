@@ -71,6 +71,8 @@ class Config:
     merge_roles: bool = field(default_factory=lambda: _env_bool("EMU_MERGE_ROLES", True))
     salvage_bare_json: bool = field(default_factory=lambda: _env_bool("EMU_SALVAGE", True))
     json_output: bool = field(default_factory=lambda: _env_bool("EMU_JSON_OUTPUT", False))
+    # Explicit opt-in: the configured upstream must accept image_url content parts.
+    image_inputs: bool = field(default_factory=lambda: _env_bool("EMU_IMAGE_INPUTS", False))
     max_result_chars: int = field(default_factory=lambda: _env_int("EMU_MAX_RESULT_CHARS", 24000))
 
     # Inbound HTTP resource limits (the server is intended for loopback use).
@@ -264,6 +266,8 @@ class CanonMessage:
     tool_calls: List[ToolCall] = field(default_factory=list)
     # tool results attached to a user turn: (tool_use_id, name, content, is_error)
     tool_results: List[Tuple[str, str, str, bool]] = field(default_factory=list)
+    # Ordered text/image parts, including correlated image-bearing tool results.
+    content_parts: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass

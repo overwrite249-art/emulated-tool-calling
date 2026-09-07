@@ -3,6 +3,7 @@ from __future__ import annotations
 from ._prelude import *  # noqa: F401,F403
 from .core import *  # noqa: F401,F403
 from .protocol import *  # noqa: F401,F403
+from .media import *  # noqa: F401,F403
 # --- end generated header ---
 
 
@@ -369,8 +370,8 @@ def extract_completion_text(data: Dict[str, Any]) -> Tuple[str, str, Dict[str, A
 # ======================================================================================
 
 
-def _blocks_to_text(content: Any) -> str:
-    """Flatten Anthropic/OpenAI content blocks into plain text."""
+def _blocks_to_text(content: Any, image_notes: bool = False) -> str:
+    """Flatten content for text history; optionally fingerprint attached images."""
     if content is None:
         return ""
     if isinstance(content, str):
@@ -391,18 +392,33 @@ def _blocks_to_text(content: Any) -> str:
         if btype == "text" or (btype is None and "text" in block):
             out.append(safe_str(block.get("text")))
         elif btype == "image" or btype == "image_url":
-            out.append("[image omitted: this model is text-only]")
+            if image_notes:
+                try:
+                    out.append(image_history_marker(block))
+                except ImageInputError as exc:
+                    raise UpstreamError(str(exc), 400) from exc
+            else:
+                out.append("[image omitted: this model is text-only]")
         elif btype == "document":
             out.append("[document omitted: this model is text-only]")
         elif btype == "thinking" or btype == "redacted_thinking":
             continue
         elif btype == "tool_result":
-            out.append(_blocks_to_text(block.get("content")))
+            out.append(_blocks_to_text(block.get("content"), image_notes))
         elif btype == "input_audio" or btype == "audio":
             out.append("[audio omitted: this model is text-only]")
         elif "text" in block:
             out.append(safe_str(block.get("text")))
     return "\n".join(p for p in out if p)
+
+
+def _image_content_parts(content: Any, cfg: Config, names: Dict[str, str]) -> List[Dict[str, Any]]:
+    if not cfg.image_inputs:
+        return []
+    try:
+        return normalize_image_content(content, names)
+    except ImageInputError as exc:
+        raise UpstreamError(str(exc), 400) from exc
 
 
 def anthropic_to_canon(body: Dict[str, Any], cfg: Config) -> CanonRequest:
@@ -446,12 +462,12 @@ def anthropic_to_canon(body: Dict[str, Any], cfg: Config) -> CanonRequest:
                     (
                         tid,
                         id_to_name.get(tid, "tool"),
-                        _blocks_to_text(block.get("content")),
+                        _blocks_to_text(block.get("content"), cfg.image_inputs),
                         bool(block.get("is_error")),
                     )
                 )
             else:
-                piece = _blocks_to_text([block])
+                piece = _blocks_to_text([block], cfg.image_inputs and role != "assistant")
                 if piece:
                     text_parts.append(piece)
 
@@ -461,6 +477,7 @@ def anthropic_to_canon(body: Dict[str, Any], cfg: Config) -> CanonRequest:
                 text="\n".join(text_parts).strip(),
                 tool_calls=calls,
                 tool_results=results,
+                content_parts=_image_content_parts(content, cfg, id_to_name) if role != "assistant" else [],
             )
         )
 
@@ -528,17 +545,22 @@ def openai_to_canon(body: Dict[str, Any], cfg: Config) -> CanonRequest:
             continue
         if role == "tool" or role == "function":
             tid = safe_str(raw.get("tool_call_id")) or safe_str(raw.get("name"))
+            name = id_to_name.get(tid, safe_str(raw.get("name")) or "tool")
             messages.append(
                 CanonMessage(
                     role="user",
                     tool_results=[
                         (
                             tid,
-                            id_to_name.get(tid, safe_str(raw.get("name")) or "tool"),
-                            _blocks_to_text(raw.get("content")),
+                            name,
+                            _blocks_to_text(raw.get("content"), cfg.image_inputs),
                             False,
                         )
                     ],
+                    content_parts=_image_content_parts(
+                        [{"type": "tool_result", "tool_use_id": tid, "content": raw.get("content")}],
+                        cfg, {tid: name},
+                    ),
                 )
             )
             continue
@@ -558,8 +580,9 @@ def openai_to_canon(body: Dict[str, Any], cfg: Config) -> CanonRequest:
         messages.append(
             CanonMessage(
                 role="assistant" if role == "assistant" else "user",
-                text=_blocks_to_text(raw.get("content")).strip(),
+                text=_blocks_to_text(raw.get("content"), cfg.image_inputs and role != "assistant").strip(),
                 tool_calls=calls,
+                content_parts=_image_content_parts(raw.get("content"), cfg, id_to_name) if role != "assistant" else [],
             )
         )
 
@@ -629,7 +652,7 @@ def openai_to_canon(body: Dict[str, Any], cfg: Config) -> CanonRequest:
 # ======================================================================================
 
 
-def build_upstream_messages(req: CanonRequest, cfg: Config, extra_system: List[str]) -> List[Dict[str, str]]:
+def build_upstream_messages(req: CanonRequest, cfg: Config, extra_system: List[str]) -> List[Dict[str, Any]]:
     system_chunks: List[str] = []
     if req.system.strip():
         system_chunks.append(req.system.strip())
@@ -657,7 +680,7 @@ def build_upstream_messages(req: CanonRequest, cfg: Config, extra_system: List[s
         if note:
             system_chunks.append(note)
 
-    out: List[Dict[str, str]] = []
+    out: List[Dict[str, Any]] = []
     if system_chunks:
         out.append({"role": "system", "content": "\n\n".join(system_chunks)})
 
@@ -670,6 +693,8 @@ def build_upstream_messages(req: CanonRequest, cfg: Config, extra_system: List[s
                 parts.append(render_tool_call_text(tc))
             body = "\n\n".join(p for p in parts if p).strip()
             out.append({"role": "assistant", "content": body or "(no output)"})
+        elif cfg.image_inputs and msg.content_parts:
+            out.append({"role": "user", "content": render_image_content(msg.content_parts, cfg)})
         else:
             parts = []
             for _tid, name, content, is_err in msg.tool_results:
@@ -682,10 +707,10 @@ def build_upstream_messages(req: CanonRequest, cfg: Config, extra_system: List[s
             out.append({"role": "user", "content": body or "(empty message)"})
 
     if cfg.merge_roles:
-        merged: List[Dict[str, str]] = []
+        merged: List[Dict[str, Any]] = []
         for m in out:
             if merged and merged[-1]["role"] == m["role"] and m["role"] != "system":
-                merged[-1]["content"] += "\n\n" + m["content"]
+                merged[-1]["content"] = merge_message_content(merged[-1]["content"], m["content"])
             else:
                 merged.append(dict(m))
         out = merged
