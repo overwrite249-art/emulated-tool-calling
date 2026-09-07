@@ -692,7 +692,7 @@ def build_upstream_messages(req: CanonRequest, cfg: Config, extra_system: List[s
     if system_chunks:
         out.append({"role": "system", "content": "\n\n".join(system_chunks)})
 
-    for msg in req.messages:
+    for msg, result_cfg in zip(req.messages, result_configs(req, cfg)):
         if msg.role == "assistant":
             parts: List[str] = []
             if msg.text:
@@ -702,12 +702,12 @@ def build_upstream_messages(req: CanonRequest, cfg: Config, extra_system: List[s
             body = "\n\n".join(p for p in parts if p).strip()
             out.append({"role": "assistant", "content": body or "(no output)"})
         elif cfg.image_inputs and msg.content_parts:
-            out.append({"role": "user", "content": render_image_content(msg.content_parts, cfg)})
+            out.append({"role": "user", "content": render_image_content(msg.content_parts, result_cfg)})
         else:
             parts = []
             for tid, name, content, is_err in msg.tool_results:
                 parts.append(
-                    history_note("Tool result", tid) + render_tool_result_text(name, content, is_err, cfg.max_result_chars)
+                    history_note("Tool result", tid) + render_tool_result_text(name, content, is_err, result_cfg.max_result_chars)
                 )
             if msg.text:
                 parts.append(msg.text)
@@ -801,3 +801,4 @@ __all__ = [
     "build_upstream_payload",
 ]
 # --- end generated header ---
+

@@ -36,7 +36,7 @@ def build_structured_payload(req: CanonRequest, cfg: Config, extra: List[str],
                              allow_tools: bool, limit: int) -> Dict[str, Any]:
     """Serialize both tool history and the new response in one consistent format."""
     messages = []
-    for message in req.messages:
+    for message, result_cfg in zip(req.messages, result_configs(req, cfg)):
         if message.role == "assistant":
             text = _structured_json({"text": message.text, "tool_calls": [
                 {"name": call.name, "arguments": call.args, "id": call.id}
@@ -44,13 +44,13 @@ def build_structured_payload(req: CanonRequest, cfg: Config, extra: List[str],
             ]})
         elif message.tool_results:
             text = _structured_json({"text": message.text, "tool_results": [
-                {"id": tid, "name": name, "content": truncate_middle(content, cfg.max_result_chars),
+                {"id": tid, "name": name, "content": truncate_middle(content, result_cfg.max_result_chars),
                  "is_error": is_error}
                 for tid, name, content, is_error in message.tool_results
             ]})
         else:
             text = message.text
-        content_parts = (render_image_content(message.content_parts, cfg, structured=True)
+        content_parts = (render_image_content(message.content_parts, result_cfg, structured=True)
                          if cfg.image_inputs and message.content_parts else [])
         messages.append(CanonMessage(role=message.role, text=text, content_parts=content_parts))
     effective = CanonRequest(
@@ -203,3 +203,4 @@ class StructuredToolParser:
 __all__ = ["STRUCTURED_LIMIT", "STRUCTURED_INSTRUCTION", "build_structured_payload",
            "extract_structured_output", "StructuredToolParser"]
 # --- end generated header ---
+
