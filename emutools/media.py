@@ -13,6 +13,11 @@ class ImageInputError(ValueError):
     """Invalid opt-in image input; no URL is fetched by this module."""
 
 
+def history_note(kind, identifier):
+    """Quote opaque IDs; these labels describe history, not new tool arguments."""
+    return kind + ' history_id=' + json.dumps(safe_str(identifier), ensure_ascii=False) + '\n' if identifier else ''
+
+
 _IMAGE_TYPES = ('image/jpeg', 'image/png', 'image/gif', 'image/webp')
 
 
@@ -160,7 +165,7 @@ def render_image_content(parts, cfg, structured=False):
             else:
                 envelope = render_tool_result_text(part['name'], '', part['is_error'], 0)
                 prefix, _, suffix = envelope.partition('\n')
-                result.append({'type': 'text', 'text': prefix + '\n'})
+                result.append({'type': 'text', 'text': history_note('Tool result', part['id']) + prefix + '\n'})
                 result.extend(inner)
                 result.append({'type': 'text', 'text': suffix})
         else:
@@ -177,6 +182,6 @@ def merge_message_content(left, right):
 
 
 # --- generated header: build_single_file.py strips these blocks ---
-__all__ = ['ImageInputError', 'image_history_marker', 'normalize_image_content',
+__all__ = ['ImageInputError', 'history_note', 'image_history_marker', 'normalize_image_content',
            'render_image_content', 'merge_message_content']
 # --- end generated header ---
