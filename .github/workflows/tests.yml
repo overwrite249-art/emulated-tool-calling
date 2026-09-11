@@ -29,6 +29,13 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Built-in 200-check suite
         run: python -m emutools --selftest
+      # On a push the single-file job below rebuilds and commits this, so only
+      # pull requests need to fail on a stale file.
+      - name: Committed single file is current
+        if: github.event_name != 'push'
+        run: python build_single_file.py --check
+      - name: Committed single file passes the whole suite on its own
+        run: python emutools.py --selftest
       - name: Build and test standalone distribution
         run: |
           python build_single_file.py "$RUNNER_TEMP/emutools.py"
@@ -38,6 +45,40 @@ jobs:
           name: emutools-python-${{ matrix.python-version }}
           path: ${{ runner.temp }}/emutools.py
           if-no-files-found: error
+
+  # Nobody has to run build_single_file.py by hand. Any push that changes the
+  # package and forgets the built file gets it rebuilt and committed here, so
+  # emutools.py at the repository root is always the current single-file build.
+  single-file:
+    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Rebuild the single file
+        run: python build_single_file.py
+      - name: Verify the rebuilt file before committing it
+        run: |
+          python -m compileall -q emutools.py
+          python emutools.py --selftest
+      - name: Commit it only when it actually changed
+        run: |
+          if git diff --quiet -- emutools.py; then
+            echo "emutools.py already current; nothing to commit"
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add emutools.py
+          git commit -m 'build: refresh single-file emutools.py'
+          git push
 
   real-cli:
     permissions:

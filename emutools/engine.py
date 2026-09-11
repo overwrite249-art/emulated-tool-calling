@@ -54,10 +54,94 @@ def _call_limit(req: CanonRequest, cfg: Config) -> int:
 
 def _call_issues(tc: ToolCall, req: CanonRequest, tools: Dict[str, ToolDef]) -> List[str]:
     if tc.name not in tools:
-        return ["Tool `%s` does not exist. Available tools: %s." % (tc.name, ", ".join(sorted(tools)) or "(none)")]
+        hint = ""
+        close = difflib.get_close_matches(tc.name, list(tools), n=1, cutoff=0.6)
+        if close:
+            hint = " Did you mean `%s`?" % close[0]
+        return ["Tool `%s` does not exist. Available tools: %s.%s"
+                % (tc.name, ", ".join(sorted(tools)) or "(none)", hint)]
     if req.tool_choice not in ("auto", "required", "none", tc.name):
         return ["Tool `%s` is not the requested tool `%s`." % (tc.name, req.tool_choice)]
     return ["Call to `%s` is invalid: %s." % (tc.name, issue) for issue in validate_args(tc.args, tools[tc.name].schema)]
+
+
+# A rejected call used to be reported to the user as the assistant's answer, which
+# ends the client's task: a coding agent that guessed one unavailable tool name gets
+# a successful-looking "[tool guard] Rejected tool call" message and stops. The
+# streaming path now re-asks upstream with the reason, exactly like the
+# non-streaming path, and only falls back to explanatory text when out of attempts.
+RETRY_INSTRUCTION = (
+    "CRITICAL: Your previous tool call was rejected and was NOT executed. "
+    "Reply with only the corrected tool call, in the required format, and no other "
+    "text. Do not repeat your previous explanation. "
+)
+_MISSING_TOOL = "does not exist"
+
+
+# An attempt that produces neither text nor a usable call is worse than a rejected
+# call: the client prints "the model returned an empty response" and ends the task.
+EMPTY_REPLY_REASON = (
+    "Your previous reply contained no text and no usable tool call. "
+    "Reply now with either one tool call or a direct answer."
+)
+
+# After a rejection the model sometimes talks instead of calling: "Now I'll write
+# payload.py." with no call at all. Accepting that ends the client's task with the
+# work half done, so a turn that already tried to call a tool has to keep trying.
+NO_CALL_REASON = (
+    "Your previous reply talked about the tool call instead of making it, so "
+    "nothing ran. Output the corrected tool call itself, with no commentary."
+)
+
+BOTCHED_CALL_REASON = (
+    "Your previous reply contained tool-call markup that could not be parsed, so "
+    "nothing ran. Emit the call again, exactly in the required format, and put no "
+    "tool-call markup in ordinary prose."
+)
+
+
+# The repeat limit stops a runaway loop, but delivering "[loop guard] Skipping a
+# repeated call" as the answer ends the client's task. Give the model the chance to
+# break the loop itself first; the guard text is the last resort that still bounds it.
+def _repeat_reason(name: str, count: int) -> str:
+    return (
+        "You have already called `%s` with exactly these arguments %d times and the "
+        "result will not change. Do not repeat it. Either call a different tool, call "
+        "it with different arguments, or give your final answer." % (name, count)
+    )
+
+
+def _named_tools(reasons: List[str], req: CanonRequest) -> List[Any]:
+    """The tools a rejection talks about, so the retry can show correct examples."""
+    blob = " ".join(reasons)
+    return [t for t in req.tools if ("`%s`" % t.name) in blob]
+
+
+def _corrective_note(reasons: List[str], req: CanonRequest) -> str:
+    """Build the retry instruction, re-teaching the tool catalogue when needed.
+
+    A model that invents a tool name tends to invent the same one again, so the
+    corrective prompt has to restate the names it may actually use. Without this,
+    three attempts are simply three identical rejections.
+    """
+    note = RETRY_INSTRUCTION + " ".join(reasons)
+    examples = [render_tool_example(t) for t in _named_tools(reasons, req)[:3]]
+    if examples:
+        note += (
+            "\nThe call must be exactly this shape, with these parameter names:\n"
+            + "\n".join(examples)
+            + "\nDo not wrap it in another object and do not rename the parameters."
+        )
+    if req.tools and any(_MISSING_TOOL in reason for reason in reasons):
+        note += (
+            "\nThe tool you named is NOT available. You may only call these tools, "
+            "using these exact names and parameters:\n"
+            + render_tool_signatures(req.tools)
+            + "\nPick the closest available tool and call it now. To create or "
+            "rewrite a file when no file-writing tool is listed, use an editing "
+            "tool on the existing file instead."
+        )
+    return note
 
 
 def run_turn(req: CanonRequest, cfg: Config) -> TurnResult:
@@ -66,11 +150,14 @@ def run_turn(req: CanonRequest, cfg: Config) -> TurnResult:
     tools_by_name = _tools_by_name(req)
     total_usage: Dict[str, Any] = {}
     max_attempts = 3 if cfg.loop_retry else 1
+    wanted_call = False
 
     for attempt in range(1, max_attempts + 1):
         payload = build_upstream_payload(req, cfg, extra, allow_tools)
         data = upstream_complete(cfg, payload)
         content, finish_reason, usage = extract_completion_text(data)
+        if cfg.log_bodies:
+            log_debug("RAW attempt %d: %s" % (attempt, truncate_middle(content, 4000)))
         text, calls = extract_tool_calls(content, tools_by_name, cfg.salvage_bare_json)
         if not usage:
             usage = {"prompt_tokens": _estimate_input_tokens(payload), "completion_tokens": estimate_tokens(content)}
@@ -95,26 +182,39 @@ def run_turn(req: CanonRequest, cfg: Config) -> TurnResult:
             blocked.append("Dropped extra calls: at most %d tool call(s) allowed in this turn." % limit)
             kept = kept[:limit]
         requires_call = allow_tools and req.tool_choice not in ("auto", "none")
+        wanted_call = wanted_call or bool(problems)
         retry_reasons = list(problems)
         if blocked and not kept:
             retry_reasons.extend(blocked)
         if requires_call and not kept:
             retry_reasons.append("This turn REQUIRES a valid call to the requested tool. Output only that call, corrected.")
+        if wanted_call and not kept and not retry_reasons:
+            retry_reasons.append(NO_CALL_REASON)
+        if not kept and not retry_reasons and looks_like_botched_call(text):
+            retry_reasons.append(BOTCHED_CALL_REASON)
         if retry_reasons and attempt < max_attempts:
             log_warn("retrying rejected tool output: %s" % retry_reasons[0][:160])
-            extra = list(extra) + ["CRITICAL: Your previous tool call was rejected. " + " ".join(retry_reasons)]
+            extra = list(extra) + [_corrective_note(retry_reasons, req)]
             continue
         if requires_call and not kept:
             raise UpstreamError("model failed to satisfy tool_choice=%s after %d attempt(s)" % (req.tool_choice, attempt), 502)
         notes.extend(problems + blocked)
-        if not text.strip() and not kept:
-            if notes:
-                text = "I stopped without executing the rejected tool call. " + " ".join(notes)
-            elif attempt < max_attempts:
+        if (not text.strip() or wanted_call) and not kept:
+            if attempt < max_attempts:
                 extra = list(extra) + ["Your previous reply was empty. Produce a substantive reply now."]
                 continue
-            else:
-                text = EMPTY_FALLBACK
+            if wanted_call or not notes:
+                # A rejection or an empty completion returned as the answer looks
+                # like a successful result and ends the client's task; a 5xx is
+                # retried instead. Deliberate policy outcomes (tools disabled, loop
+                # guard) are still explained in text, because there the request
+                # itself asked for prose.
+                raise UpstreamError(
+                    ("upstream produced no usable reply after %d attempt(s): " % attempt)
+                    + (" ".join(notes) if notes else "empty completion"),
+                    529,
+                )
+            text = "I stopped without executing the rejected tool call. " + " ".join(notes)
         return TurnResult(text=text, calls=kept, usage=total_usage, notes=notes, attempts=attempt,
                           finish="tool_calls" if kept else ("length" if finish_reason in ("length", "max_tokens") else "stop"))
     raise AssertionError("unreachable: at least one completion attempt is required")
@@ -124,97 +224,189 @@ def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]
     """Streaming: yields ('text', str) | ('call', ToolCall) | ('usage', dict) | ('finish', str).
 
     Loop protection is applied at the moment a call completes, before it reaches the
-    client, so a blocked call is converted into an explanatory text delta instead.
+    client. A rejected call is re-asked upstream with the rejection reason, within the
+    same client stream, so one bad tool name cannot end the client's whole task; only
+    when the attempts run out does it become explanatory text.
     """
     st, extra, allow_tools = _prepare(req, cfg)
     tools_by_name = _tools_by_name(req)
-    payload = build_upstream_payload(req, cfg, extra, allow_tools)
+    max_attempts = 3 if cfg.loop_retry else 1
 
-    parser = StreamToolParser(tools_by_name, cfg.salvage_bare_json)
     emitted_calls: List[ToolCall] = []
     seen_this_turn: Dict[str, int] = {}
-    usage: Dict[str, Any] = {}
+    usage_total: Dict[str, Any] = {}
+    usage_reported = False
     finish_reason = "stop"
     any_text = False
     raw_len = 0
+    corrective: List[str] = []
+    final_issues: List[str] = []
+    wanted_call = False
+    loop_stopped = False
+    payload: Dict[str, Any] = {}
 
-    def consider(tc: ToolCall) -> Iterator[Tuple[str, Any]]:
-        nonlocal any_text
-        fp = tc.fp()
-        if not allow_tools:
-            yield (
-                "text",
-                "\n\n[tool guard] Tool calls are disabled for this turn (choice or conversation budget).",
-            )
-            any_text = True
-            return
-        issues = _call_issues(tc, req, tools_by_name)
-        if issues:
-            if req.tool_choice not in ("auto", "none", "required") and tc.name != req.tool_choice:
-                raise UpstreamError("model did not call the requested tool `%s`" % req.tool_choice, 502)
-            yield ("text", "\n\n[tool guard] Rejected tool call: " + " ".join(issues))
-            any_text = True
-            return
-        if seen_this_turn.get(fp, 0) >= 1:
-            return
-        if st.counts.get(fp, 0) >= cfg.max_repeat:
-            yield (
-                "text",
-                "\n\n[loop guard] Skipping a repeated `%s` call - identical arguments "
-                "were already used %d times." % (tc.name, st.counts.get(fp, 0)),
-            )
-            any_text = True
-            return
-        if len(emitted_calls) >= _call_limit(req, cfg):
-            return
-        seen_this_turn[fp] = 1
-        emitted_calls.append(tc)
-        yield ("call", tc)
+    for attempt in range(1, max_attempts + 1):
+        last_attempt = attempt >= max_attempts
+        payload = build_upstream_payload(req, cfg, extra + corrective, allow_tools)
+        parser = StreamToolParser(tools_by_name, cfg.salvage_bare_json)
+        rejected: List[str] = []
+        attempt_raw = 0
+        attempt_usage = False
+        attempt_text = ""
 
-    for event in upstream_stream(cfg, payload):
-        if "usage" in event:
-            usage = event["usage"]
+        def consider(tc: ToolCall) -> Iterator[Tuple[str, Any]]:
+            nonlocal wanted_call, loop_stopped
+            fp = tc.fp()
+            if not allow_tools:
+                yield (
+                    "text",
+                    "\n\n[tool guard] Tool calls are disabled for this turn (choice or conversation budget).",
+                )
+                return
+            issues = _call_issues(tc, req, tools_by_name)
+            if issues:
+                wanted_call = True
+                if req.tool_choice not in ("auto", "none", "required") and tc.name != req.tool_choice:
+                    raise UpstreamError("model did not call the requested tool `%s`" % req.tool_choice, 502)
+                if last_attempt:
+                    # Out of attempts. Say nothing: explaining the rejection here
+                    # would make the proxy's diagnostic the assistant's answer, and
+                    # the client would treat that as a finished task.
+                    final_issues.extend(issues)
+                else:
+                    rejected.extend(issues)
+                return
+            if seen_this_turn.get(fp, 0) >= 1:
+                return
+            if st.counts.get(fp, 0) >= cfg.max_repeat:
+                if not last_attempt:
+                    # Not `wanted_call`: here a prose answer is exactly what the
+                    # model is being asked for instead of the pointless repeat.
+                    rejected.append(_repeat_reason(tc.name, st.counts.get(fp, 0)))
+                    return
+                loop_stopped = True
+                yield (
+                    "text",
+                    "\n\n[loop guard] Skipping a repeated `%s` call - identical arguments "
+                    "were already used %d times." % (tc.name, st.counts.get(fp, 0)),
+                )
+                return
+            if len(emitted_calls) >= _call_limit(req, cfg):
+                return
+            seen_this_turn[fp] = 1
+            emitted_calls.append(tc)
+            yield ("call", tc)
+
+        stream = upstream_stream(cfg, payload)
+        held: List[Tuple[str, Any]] = []
+        seen_raw: List[str] = []
+        try:
+            for event in stream:
+                if "usage" in event:
+                    for key, value in (event["usage"] or {}).items():
+                        if isinstance(value, (int, float)) and not isinstance(value, bool):
+                            usage_total[key] = usage_total.get(key, 0) + value
+                            usage_reported = True
+                            attempt_usage = True
+                    continue
+                if "finish" in event:
+                    finish_reason = event["finish"] or finish_reason
+                    continue
+                if "reasoning" in event:
+                    continue  # never parse reasoning traces as tool calls
+                chunk = event.get("text")
+                if not chunk:
+                    continue
+                raw_len += len(chunk)
+                attempt_raw += len(chunk)
+                if cfg.log_bodies:
+                    seen_raw.append(chunk)
+                before = len(parser.calls)
+                pieces = parser.feed(chunk)
+                for piece in pieces:
+                    if piece:
+                        held.append(("text", piece))
+                for tc in parser.calls[before:]:
+                    for out in consider(tc):
+                        held.append(out)
+                if rejected:
+                    # Text produced next to a call that is about to be re-asked is
+                    # dropped with it, so a retry cannot duplicate the preamble.
+                    break  # stop paying for output that cannot be used
+                for out in held:
+                    if out[0] == "text":
+                        any_text = True
+                        attempt_text += out[1]
+                    yield out
+                held = []
+
+            if not rejected:
+                before = len(parser.calls)
+                tail_pieces, _all_calls = parser.finish()
+                for piece in tail_pieces:
+                    if piece:
+                        held.append(("text", piece))
+                for tc in parser.calls[before:]:
+                    for out in consider(tc):
+                        held.append(out)
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
+            if cfg.log_bodies:
+                log_debug("RAW attempt %d: %s"
+                          % (attempt, truncate_middle("".join(seen_raw), 4000)))
+
+        requires_call = allow_tools and req.tool_choice not in ("auto", "none")
+        if not rejected and requires_call and not emitted_calls and not last_attempt:
+            rejected.append(
+                "This turn REQUIRES a valid call to the requested tool. "
+                "Output only that call, corrected."
+            )
+        if not rejected and not emitted_calls and not last_attempt:
+            if wanted_call:
+                rejected.append(NO_CALL_REASON)
+            elif not any_text:
+                rejected.append(EMPTY_REPLY_REASON)
+            elif looks_like_botched_call(attempt_text):
+                rejected.append(BOTCHED_CALL_REASON)
+        if rejected and not emitted_calls:
+            # Abandoning the stream early saves output tokens, but the tokens already
+            # produced were still billed, so estimate them instead of losing them.
+            if not attempt_usage:
+                usage_total["prompt_tokens"] = (
+                    usage_total.get("prompt_tokens", 0) + _estimate_input_tokens(payload))
+                usage_total["completion_tokens"] = (
+                    usage_total.get("completion_tokens", 0) + estimate_tokens("x" * attempt_raw))
+                usage_reported = True
+            log_warn("retrying rejected streamed tool output: %s" % rejected[0][:160])
+            corrective = [_corrective_note(rejected, req)]
+            held = []
             continue
-        if "finish" in event:
-            finish_reason = event["finish"] or finish_reason
-            continue
-        if "reasoning" in event:
-            continue  # never parse reasoning traces as tool calls
-        chunk = event.get("text")
-        if not chunk:
-            continue
-        raw_len += len(chunk)
-        before = len(parser.calls)
-        pieces = parser.feed(chunk)
-        for piece in pieces:
-            if piece:
+        for out in held:
+            if out[0] == "text":
                 any_text = True
-                yield ("text", piece)
-        for tc in parser.calls[before:]:
-            for out in consider(tc):
-                yield out
-
-    before = len(parser.calls)
-    tail_pieces, _all_calls = parser.finish()
-    for piece in tail_pieces:
-        if piece:
-            any_text = True
-            yield ("text", piece)
-    for tc in parser.calls[before:]:
-        for out in consider(tc):
+                attempt_text += out[1]
             yield out
+        held = []
+        break
 
     if allow_tools and req.tool_choice not in ("auto", "none") and not emitted_calls:
         raise UpstreamError("model failed to satisfy tool_choice=%s" % req.tool_choice, 502)
-    if not any_text and not emitted_calls:
-        yield ("text", EMPTY_FALLBACK)
+    if not emitted_calls and not loop_stopped and (not any_text or wanted_call):
+        # Ending the turn here would hand the client a successful-looking answer that
+        # is really a proxy diagnostic, and the client would stop working. A 5xx is
+        # honest and is what the client retries, so the task survives a bad sample.
+        raise UpstreamError(
+            ("upstream produced no usable reply after %d attempt(s): " % max_attempts)
+            + (" ".join(final_issues) if final_issues else "empty completion"), 529)
 
-    if not usage:
-        usage = {
+    if not usage_reported:
+        usage_total = {
             "prompt_tokens": _estimate_input_tokens(payload),
             "completion_tokens": estimate_tokens("x" * raw_len),
         }
-    yield ("usage", usage)
+    yield ("usage", usage_total)
     yield (
         "finish",
         "tool_calls"
@@ -271,6 +463,14 @@ def sse(event: str, data: Dict[str, Any]) -> bytes:
 def anthropic_stream_bytes(req: CanonRequest, cfg: Config) -> Iterator[bytes]:
     msg_id = new_message_id("msg")
     model = req.model or "emulated"
+    turn = run_turn_stream(req, cfg)
+    # Pull the first usable event before announcing the message. A turn that fails
+    # outright then raises before any byte is written, so the caller can still answer
+    # with an HTTP status the client retries instead of a truncated stream.
+    try:
+        first: Optional[Tuple[str, Any]] = next(turn)
+    except StopIteration:
+        first = None
     yield sse(
         "message_start",
         {
@@ -295,7 +495,13 @@ def anthropic_stream_bytes(req: CanonRequest, cfg: Config) -> Iterator[bytes]:
     out_chars = 0
 
     try:
-        for kind, value in run_turn_stream(req, cfg):
+        def replay() -> Iterator[Tuple[str, Any]]:
+            if first is not None:
+                yield first
+            for event in turn:
+                yield event
+
+        for kind, value in replay():
             if kind == "text":
                 if not text_open:
                     yield sse(
@@ -433,6 +639,11 @@ def openai_stream_bytes(req: CanonRequest, cfg: Config, include_usage: bool) -> 
         }
         return ("data: %s\n\n" % json.dumps(obj, ensure_ascii=False)).encode("utf-8")
 
+    turn = run_turn_stream(req, cfg)
+    try:
+        first: Optional[Tuple[str, Any]] = next(turn)
+    except StopIteration:
+        first = None
     yield chunk({"role": "assistant", "content": ""})
 
     tool_index = 0
@@ -440,8 +651,14 @@ def openai_stream_bytes(req: CanonRequest, cfg: Config, include_usage: bool) -> 
     finish = "stop"
     out_chars = 0
 
+    def replay() -> Iterator[Tuple[str, Any]]:
+        if first is not None:
+            yield first
+        for event in turn:
+            yield event
+
     try:
-        for kind, value in run_turn_stream(req, cfg):
+        for kind, value in replay():
             if kind == "text":
                 out_chars += len(value)
                 yield chunk({"content": value})

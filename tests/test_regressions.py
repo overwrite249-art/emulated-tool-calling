@@ -172,24 +172,41 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaises(engine.UpstreamError):
             self.run_stream(call(file_path="a"), tool_choice="Write")
 
+    # A rejected call must not reach the client, and must not be reported to the
+    # client as the assistant's own answer either: a coding agent that receives
+    # "[tool guard] Rejected tool call" as a successful result stops working. The
+    # turn fails with a retryable status instead, so the client re-asks.
     def test_invalid_sync_arguments_never_reach_client(self):
-        result = self.run_sync(call())
-        self.assertFalse(result.calls)
-        self.assertTrue(result.text.strip())
+        with self.assertRaises(engine.UpstreamError) as caught:
+            self.run_sync(call(file_path=["not", "a", "string"]))
+        self.assertEqual(caught.exception.status, 529)
 
     def test_invalid_stream_arguments_never_reach_client(self):
-        events = self.run_stream(call())
-        self.assertFalse([v for k, v in events if k == "call"])
-        self.assertTrue([v for k, v in events if k == "text"])
+        with self.assertRaises(engine.UpstreamError) as caught:
+            self.run_stream(call(file_path=["not", "a", "string"]))
+        self.assertEqual(caught.exception.status, 529)
+
+    def test_unusable_stream_turn_fails_before_the_first_byte(self):
+        req = self.request(stream=True)
+        with patch.object(engine, "upstream_stream",
+                          side_effect=lambda *_: chunks(call(file_path=["x"]))):
+            with self.assertRaises(engine.UpstreamError):
+                next(engine.anthropic_stream_bytes(req, Config(loop_retry=False, use_stop=False)))
 
     def test_sync_validation_fails_closed_after_all_repairs(self):
-        with patch.object(engine, "upstream_complete", return_value=completion(call())) as upstream:
-            result = engine.run_turn(self.request(), Config(use_stop=False))
-        self.assertEqual(upstream.call_count, 3)
+        bad = completion(call(file_path=["not", "a", "string"]))
+        with patch.object(engine, "upstream_complete", return_value=bad) as upstream:
+            with self.assertRaises(engine.UpstreamError) as caught:
+                engine.run_turn(self.request(), Config(use_stop=False))
+        self.assertEqual(upstream.call_count, 3, "bounded: three attempts, not a loop")
+        self.assertEqual(caught.exception.status, 529)
+
+    def test_policy_refusals_are_still_explained_in_text(self):
+        # Tools disabled is a deliberate outcome of the client's own request, not a
+        # broken sample, so it stays an answer instead of becoming an error.
+        result = self.run_sync(call(file_path="a"), tool_choice="none")
         self.assertFalse(result.calls)
-        self.assertTrue(result.text.strip())
-        self.assertEqual(result.usage.get("prompt_tokens"), 33)
-        self.assertEqual(result.usage.get("completion_tokens"), 21)
+        self.assertIn("Tool calls are disabled", result.text)
 
     def test_parallel_false_is_enforced_sync(self):
         result = self.run_sync(call(file_path="a") + call(file_path="b"))
@@ -217,8 +234,22 @@ class PolicyTests(unittest.TestCase):
         def fail(*_):
             raise engine.UpstreamError("upstream unavailable", 503)
             yield
+        def fail_midway(*_):
+            yield ("text", "partial")
+            raise engine.UpstreamError("upstream unavailable", 503)
+
+        # Before the first byte the failure is still an exception, so the caller can
+        # answer with an HTTP status the client retries.
         with patch.object(engine, "run_turn_stream", side_effect=fail):
+            with self.assertRaises(engine.UpstreamError):
+                b"".join(engine.anthropic_stream_bytes(req, Config()))
+            with self.assertRaises(engine.UpstreamError):
+                b"".join(engine.openai_stream_bytes(req, Config(), False))
+        # Once bytes are on the wire it becomes an in-band error event, never a
+        # normal completion.
+        with patch.object(engine, "run_turn_stream", side_effect=fail_midway):
             anthropic = b"".join(engine.anthropic_stream_bytes(req, Config()))
+        with patch.object(engine, "run_turn_stream", side_effect=fail_midway):
             openai = b"".join(engine.openai_stream_bytes(req, Config(), False))
         self.assertIn(b'event: error', anthropic)
         self.assertNotIn(b'event: message_stop', anthropic)
@@ -237,8 +268,8 @@ class PolicyTests(unittest.TestCase):
 
 class ConfigAndSchemaTests(unittest.TestCase):
     def test_documented_model_map_syntax(self):
-        cfg = Config(model_map_raw="my-model=deepseek-v4-pro,tiny=deepseek-v4-flash")
-        self.assertEqual(cfg.model_map(), {"my-model": "deepseek-v4-pro", "tiny": "deepseek-v4-flash"})
+        cfg = Config(model_map_raw="my-model=deepseek-v4-pro,tiny=deepseek-flash")
+        self.assertEqual(cfg.model_map(), {"my-model": "deepseek-v4-pro", "tiny": "deepseek-flash"})
 
     def test_nested_required_is_validated(self):
         schema = {"properties": {"input": {"type": "object", "required": ["path"]}}}

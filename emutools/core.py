@@ -56,7 +56,7 @@ class Config:
 
     # Model routing. Clients send e.g. "claude-sonnet-4-5"; we map onto upstream ids.
     model_big: str = field(default_factory=lambda: _env("EMU_MODEL_BIG", "deepseek-v4-pro"))
-    model_small: str = field(default_factory=lambda: _env("EMU_MODEL_SMALL", "deepseek-v4-flash"))
+    model_small: str = field(default_factory=lambda: _env("EMU_MODEL_SMALL", "deepseek-flash"))
     model_map_raw: str = field(default_factory=lambda: _env("EMU_MODEL_MAP", ""))
 
     # Loop / runaway protection

@@ -515,8 +515,28 @@ def _selftest_part3(r: "_Runner", mock: "_MockUpstream", pport: int, saved: Conf
         r.check("tool schemas removed at budget", "### Read" not in sysp, sysp[:200])
         r.check("budget message injected", "maximum number of tool calls" in sysp, sysp[:300])
 
-        # streaming loop guard
-        mock.script(repeat_call)
+        # Streaming loop guard: the model gets told the repeat is pointless and is
+        # given the chance to break the loop itself before the guard ends the turn.
+        mock.script(repeat_call, "I already have that; here is the answer.")
+        status, body = _http(
+            pport,
+            "/v1/messages",
+            {
+                "model": "claude-sonnet-4-5-20250929",
+                "max_tokens": 512,
+                "messages": looping_history(3),
+                "tools": _anthropic_tools(),
+                "stream": True,
+            },
+        )
+        evs = _parse_sse(body)
+        txt = "".join(e[1]["delta"].get("text", "")
+                      for e in evs if e[0] == "content_block_delta")
+        r.check("streaming repeat is re-asked, not answered with the guard",
+                "here is the answer" in txt and "loop guard" not in txt, repr(txt))
+
+        # Three repeats in a row is a real runaway loop, and the guard still stops it.
+        mock.script(repeat_call, repeat_call, repeat_call)
         status, body = _http(
             pport,
             "/v1/messages",
@@ -575,6 +595,9 @@ def _selftest_part3(r: "_Runner", mock: "_MockUpstream", pport: int, saved: Conf
         )
         r.check("non-JSON upstream handled", status >= 400, str(status))
 
+        # Three empty samples in a row are re-asked, then reported as a retryable
+        # error. Answering "(empty response)" with a 200 instead would look to a
+        # coding client like a finished task.
         mock.script("", "", "")
         status, body = _http(
             pport,
@@ -586,11 +609,24 @@ def _selftest_part3(r: "_Runner", mock: "_MockUpstream", pport: int, saved: Conf
             },
         )
         data = json.loads(body)
-        r.eq("empty upstream -> 200", status, 200)
-        r.check("empty upstream -> non-empty content", len(data.get("content") or []) >= 1, body[:200])
+        r.eq("empty upstream -> retryable status", status, 529)
+        r.check("empty upstream -> error body", data.get("type") == "error", body[:200])
+
+        mock.script("", "", "recovered after empty samples")
+        status, body = _http(
+            pport,
+            "/v1/messages",
+            {
+                "model": "claude-sonnet-4-5-20250929",
+                "max_tokens": 128,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        data = json.loads(body)
+        r.eq("empty upstream retried -> 200", status, 200)
         r.check(
-            "empty content block has text",
-            bool((data["content"][0].get("text") or "").strip()),
+            "empty upstream retried -> real text",
+            "recovered after empty samples" in json.dumps(data.get("content") or []),
             body[:200],
         )
 
@@ -870,7 +906,7 @@ def _selftest_part3(r: "_Runner", mock: "_MockUpstream", pport: int, saved: Conf
         r.eq("all concurrent requests 200", sorted(set(results)), [200])
 
         # --- regressions built from bytes a real upstream actually returned
-        r.section("14. Real captured output (deepseek-v4-flash, live API)")
+        r.section("14. Real captured output (deepseek-flash, live API)")
 
         # (a) canonical protocol, truncated by our own stop sequence
         real1 = '<tool_call>\n{"name": "Bash", "arguments": {"command": "wc -l /etc/hosts"}}\n'

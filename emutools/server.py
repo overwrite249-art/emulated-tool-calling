@@ -322,6 +322,31 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- handlers ----------
 
+    def _stream_out(self, protocol: str, pieces: Any) -> None:
+        """Stream a generator, but let it fail with a real status before the headers.
+
+        The generators hold back their first event until the turn is known to be
+        usable, so a turn that cannot be salvaged reaches the client as a retryable
+        HTTP error rather than as a truncated 200 stream.
+        """
+        source = iter(pieces)
+        try:
+            first = next(source)
+        except StopIteration:
+            first = None
+        except UpstreamError as exc:
+            log_error("stream refused: %s" % exc.message)
+            self._error(protocol, exc.status or 502, exc.message, "api_error")
+            return
+        if not self._start_stream():
+            return
+        if first is not None and not self._write_chunk(first):
+            return
+        for piece in source:
+            if not self._write_chunk(piece):
+                return
+        self._end_chunks()
+
     def _handle_count_tokens(self, body: Dict[str, Any]) -> None:
         validate_request(body, "anthropic")
         req = anthropic_to_canon(body, self.cfg)
@@ -345,12 +370,7 @@ class Handler(BaseHTTPRequestHandler):
             )
         )
         if req.stream:
-            if not self._start_stream():
-                return
-            for piece in anthropic_stream_bytes(req, self.cfg):
-                if not self._write_chunk(piece):
-                    return
-            self._end_chunks()
+            self._stream_out("anthropic", anthropic_stream_bytes(req, self.cfg))
             return
         res = run_turn(req, self.cfg)
         for note in res.notes:
@@ -375,12 +395,7 @@ class Handler(BaseHTTPRequestHandler):
             )
         )
         if req.stream:
-            if not self._start_stream():
-                return
-            for piece in openai_stream_bytes(req, self.cfg, include_usage):
-                if not self._write_chunk(piece):
-                    return
-            self._end_chunks()
+            self._stream_out("openai", openai_stream_bytes(req, self.cfg, include_usage))
             return
         res = run_turn(req, self.cfg)
         for note in res.notes:

@@ -501,10 +501,21 @@ def run_selftest() -> int:  # noqa: C901 - a test suite is allowed to be long
     )
     r.check("bare JSON salvaged", len(cc) == 1, repr(cc))
 
+    # A bare call to a tool the client never registered is still a call. Leaving it
+    # as text made it the assistant's answer and ended the client's task; it has to
+    # reach the validator so the model is told which tools exist.
     t, cc = extract_tool_calls(
         '{"name":"NotATool","arguments":{"x":1}}', DEMO_BY_NAME, salvage=True
     )
-    r.check("unknown bare JSON not salvaged", not cc, repr(cc))
+    r.check("unknown bare JSON is recognized as a call",
+            len(cc) == 1 and cc[0].name == "NotATool" and not t, repr((t, cc)))
+
+    t, cc = extract_tool_calls(
+        "I'll do that now.\n\n{\"name\":\"Read\",\"arguments\":{\"file_path\":\"/a\"}}",
+        DEMO_BY_NAME, salvage=True
+    )
+    r.check("bare JSON after prose salvaged",
+            len(cc) == 1 and t == "I'll do that now.", repr((t, cc)))
 
     t, cc = extract_tool_calls(
         'Here is JSON I am discussing: {"name":"Read"} - note it has no arguments key.',

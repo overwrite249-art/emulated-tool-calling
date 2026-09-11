@@ -4,11 +4,16 @@
 
     python3 build_single_file.py             # writes ./emutools.py
     python3 build_single_file.py out.py      # writes ./out.py
+    python3 build_single_file.py --check     # exit 1 if ./emutools.py is stale
 
-The package exists so the code is reviewable module by module. The proxy is
-meant to be *deployed* as one dependency-free file you can scp to a box, and
-this script produces exactly that. The output is verified to parse before it is
-written, and `emutools.py --selftest` is the real check that it worked.
+Nobody has to run this by hand. The built file is committed at the repository
+root, so `curl`-and-run works straight from a clone, and CI rebuilds it on every
+push to the default branch and commits it back when it differs (`--check` is what
+makes a stale file a red build). The package exists so the code is reviewable
+module by module; the single file is what you deploy.
+
+The output is verified to parse before it is written, and `emutools.py --selftest`
+is the real check that it worked.
 """
 import ast
 import os
@@ -44,10 +49,8 @@ def strip_generated(text):
     return "\n".join(kept).strip("\n")
 
 
-def main(argv=None):
-    argv = sys.argv[1:] if argv is None else argv
-    dest = argv[0] if argv else os.path.join(HERE, "emutools.py")
-
+def render():
+    """Return the full text of the single-file build."""
     init = open(os.path.join(PKG, "__init__.py"), encoding="utf-8").read()
     doc = ast.get_docstring(ast.parse(init))
     if not doc:
@@ -69,6 +72,27 @@ def main(argv=None):
 
     # Refuse to emit a file that will not even parse.
     ast.parse(text)
+    return text
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    check = "--check" in argv
+    argv = [a for a in argv if a != "--check"]
+    dest = argv[0] if argv else os.path.join(HERE, "emutools.py")
+    text = render()
+
+    if check:
+        current = None
+        if os.path.exists(dest):
+            with open(dest, encoding="utf-8") as fh:
+                current = fh.read()
+        if current == text:
+            print("%s is up to date (%d lines)" % (dest, text.count("\n")))
+            return 0
+        print("%s is stale: run `python3 build_single_file.py` and commit the result"
+              % dest, file=sys.stderr)
+        return 1
 
     with open(dest, "w", encoding="utf-8") as fh:
         fh.write(text)

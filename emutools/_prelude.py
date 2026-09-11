@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import difflib
 import math
 import http.client
 import hashlib
@@ -32,6 +33,7 @@ __all__ = [
     "annotations",
     "argparse",
     "codecs",
+    "difflib",
     "math",
     "http",
     "hashlib",
