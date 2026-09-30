@@ -583,6 +583,11 @@ STREAM_SENTINELS = (
         "</\uff5c\uff5cdsml\uff5c\uff5c",
         "<||dsml||",
         "</||dsml||",
+        # DeepSeek V3.2 writes a single fullwidth pipe: '<｜DSML｜invoke ...>'.
+        "<\uff5cdsml\uff5c",
+        "</\uff5cdsml\uff5c",
+        "<|dsml|",
+        "</|dsml|",
     ]
 )
 _MAX_SENTINEL = max(len(s) for s in STREAM_SENTINELS)
@@ -826,7 +831,21 @@ def validate_args(args: Dict[str, Any], schema: Optional[Dict[str, Any]]) -> Lis
 
     if not isinstance(args, dict):
         return ["arguments must be an object"]
-    return check(args, root, "arguments", 0)
+
+    def non_finite(value: Any, path: str, depth: int = 0) -> List[str]:
+        # NaN/Infinity would be serialized as bare NaN, which is not JSON and
+        # breaks the client's argument parser, whatever the schema says.
+        if isinstance(value, float) and not math.isfinite(value):
+            return [path + " must be a finite number"]
+        if depth > 64:
+            return []
+        if isinstance(value, dict):
+            return [e for k, v in value.items() for e in non_finite(v, path + "." + str(k), depth + 1)]
+        if isinstance(value, list):
+            return [e for i, v in enumerate(value) for e in non_finite(v, "%s[%d]" % (path, i), depth + 1)]
+        return []
+
+    return (non_finite(args, "arguments") + check(args, root, "arguments", 0))[:20]
 
 
 # Keys a model uses when it writes a call envelope. A weak model often writes the
@@ -975,7 +994,7 @@ def repair_args(
         changed = True
 
     extra = schema.get("additionalProperties")
-    if strays and extra is not True:
+    if strays and extra is not True and not isinstance(extra, dict):
         for key in strays:
             out.pop(key, None)
         changed = True
@@ -1406,6 +1425,8 @@ def extract_tool_calls(
             calls.append(call)
             rest = rest[end:]
         if calls:
+            # The call's own closing fence is left at the head of `rest`.
+            rest = re.sub(r"\A[ \t]*\n?[ \t]*`{3}[ \t]*(?=\n|\Z)", "", rest)
             visible = _clean_trailing_fence("".join(kept)) + rest
 
     return visible.strip(), calls

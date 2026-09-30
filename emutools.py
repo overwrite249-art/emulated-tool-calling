@@ -174,7 +174,10 @@ class Config:
         if low.startswith("deepseek") or low.startswith("qwen") or low.startswith("glm"):
             return requested
         # Small/fast tier used by Claude Code for titles & cheap classification.
-        if any(tok in low for tok in ("haiku", "mini", "small", "flash", "fast", "lite")):
+        # Match whole name tokens: a substring test sent "gemini-2.5-pro" to the
+        # small tier because it contains "mini".
+        tokens = set(re.split(r"[^a-z0-9]+", low))
+        if tokens & {"haiku", "mini", "small", "flash", "fast", "lite"}:
             return self.model_small
         return self.model_big
 
@@ -916,6 +919,11 @@ STREAM_SENTINELS = (
         "</\uff5c\uff5cdsml\uff5c\uff5c",
         "<||dsml||",
         "</||dsml||",
+        # DeepSeek V3.2 writes a single fullwidth pipe: '<｜DSML｜invoke ...>'.
+        "<\uff5cdsml\uff5c",
+        "</\uff5cdsml\uff5c",
+        "<|dsml|",
+        "</|dsml|",
     ]
 )
 _MAX_SENTINEL = max(len(s) for s in STREAM_SENTINELS)
@@ -1159,7 +1167,21 @@ def validate_args(args: Dict[str, Any], schema: Optional[Dict[str, Any]]) -> Lis
 
     if not isinstance(args, dict):
         return ["arguments must be an object"]
-    return check(args, root, "arguments", 0)
+
+    def non_finite(value: Any, path: str, depth: int = 0) -> List[str]:
+        # NaN/Infinity would be serialized as bare NaN, which is not JSON and
+        # breaks the client's argument parser, whatever the schema says.
+        if isinstance(value, float) and not math.isfinite(value):
+            return [path + " must be a finite number"]
+        if depth > 64:
+            return []
+        if isinstance(value, dict):
+            return [e for k, v in value.items() for e in non_finite(v, path + "." + str(k), depth + 1)]
+        if isinstance(value, list):
+            return [e for i, v in enumerate(value) for e in non_finite(v, "%s[%d]" % (path, i), depth + 1)]
+        return []
+
+    return (non_finite(args, "arguments") + check(args, root, "arguments", 0))[:20]
 
 
 # Keys a model uses when it writes a call envelope. A weak model often writes the
@@ -1308,7 +1330,7 @@ def repair_args(
         changed = True
 
     extra = schema.get("additionalProperties")
-    if strays and extra is not True:
+    if strays and extra is not True and not isinstance(extra, dict):
         for key in strays:
             out.pop(key, None)
         changed = True
@@ -1739,6 +1761,8 @@ def extract_tool_calls(
             calls.append(call)
             rest = rest[end:]
         if calls:
+            # The call's own closing fence is left at the head of `rest`.
+            rest = re.sub(r"\A[ \t]*\n?[ \t]*`{3}[ \t]*(?=\n|\Z)", "", rest)
             visible = _clean_trailing_fence("".join(kept)) + rest
 
     return visible.strip(), calls
@@ -2481,7 +2505,7 @@ def anthropic_to_canon(body: Dict[str, Any], cfg: Config) -> CanonRequest:
         elif ttype == "tool":
             choice = safe_str(tc.get("name")) or "required"
     elif isinstance(tc, str):
-        choice = tc
+        choice = "required" if tc in ("any", "required") else (tc if tc in ("auto", "none") else "auto")
 
     stops = body.get("stop_sequences")
     if not isinstance(stops, list):
@@ -2548,6 +2572,14 @@ def openai_to_canon(body: Dict[str, Any], cfg: Config) -> CanonRequest:
             tid = safe_str(nc.get("id")) or new_openai_call_id()
             id_to_name[tid] = nm
             calls.append(ToolCall(name=nm, args=parsed if isinstance(parsed, dict) else {}, id=tid))
+        legacy = raw.get("function_call")
+        if not calls and isinstance(legacy, dict) and safe_str(legacy.get("name")):
+            # Legacy `functions` API: the reply to it is keyed by name, not id.
+            nm = safe_str(legacy.get("name"))
+            args_raw = legacy.get("arguments")
+            parsed, _ = loads_tolerant(args_raw if isinstance(args_raw, str) else canon_json(args_raw))
+            id_to_name[nm] = nm
+            calls.append(ToolCall(name=nm, args=parsed if isinstance(parsed, dict) else {}, id=nm))
 
         messages.append(
             CanonMessage(
@@ -2584,7 +2616,7 @@ def openai_to_canon(body: Dict[str, Any], cfg: Config) -> CanonRequest:
     choice = "auto"
     tc = body.get("tool_choice")
     if isinstance(tc, str):
-        choice = tc if tc in ("auto", "none", "required") else "auto"
+        choice = "required" if tc == "any" else (tc if tc in ("auto", "none", "required") else "auto")
     elif isinstance(tc, dict):
         if tc.get("type") == "function":
             fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
@@ -3474,6 +3506,12 @@ class RequestError(ValueError):
 
 def validate_request(body: Dict[str, Any], protocol: str) -> None:
     """Reject malformed client values before conversion or starting a 200 stream."""
+    # The OpenAI API accepts explicit nulls for unset optional fields, and SDK
+    # wrappers send them; Anthropic does not, so keep rejecting them there.
+    if protocol == "openai":
+        for name in ("max_tokens", "max_completion_tokens", "stream", "parallel_tool_calls", "tool_choice"):
+            if name in body and body[name] is None:
+                del body[name]
     for name in ("max_tokens", "max_completion_tokens"):
         if name in body and (isinstance(body[name], bool) or not isinstance(body[name], int) or body[name] <= 0):
             raise RequestError(name + " must be a positive integer")
@@ -3798,11 +3836,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self._start_stream():
             return
-        if first is not None and not self._write_chunk(first):
-            return
-        for piece in source:
-            if not self._write_chunk(piece):
+        # Headers are sent: an exception must not reach do_POST, which would write a
+        # second HTTP response into the chunked body. Drop the connection without
+        # the terminating chunk so the client sees an interrupted stream.
+        try:
+            if first is not None and not self._write_chunk(first):
                 return
+            for piece in source:
+                if not self._write_chunk(piece):
+                    return
+        except Exception as exc:  # noqa: BLE001
+            log_error("stream aborted after headers: %s\n%s" % (exc, traceback.format_exc()))
+            self.close_connection = True
+            return
         self._end_chunks()
 
     def _handle_count_tokens(self, body: Dict[str, Any]) -> None:
