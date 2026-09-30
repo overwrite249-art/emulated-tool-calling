@@ -117,7 +117,10 @@ class Config:
         if low.startswith("deepseek") or low.startswith("qwen") or low.startswith("glm"):
             return requested
         # Small/fast tier used by Claude Code for titles & cheap classification.
-        if any(tok in low for tok in ("haiku", "mini", "small", "flash", "fast", "lite")):
+        # Match whole name tokens: a substring test sent "gemini-2.5-pro" to the
+        # small tier because it contains "mini".
+        tokens = set(re.split(r"[^a-z0-9]+", low))
+        if tokens & {"haiku", "mini", "small", "flash", "fast", "lite"}:
             return self.model_small
         return self.model_big
 

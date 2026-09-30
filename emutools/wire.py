@@ -487,7 +487,7 @@ def anthropic_to_canon(body: Dict[str, Any], cfg: Config) -> CanonRequest:
         elif ttype == "tool":
             choice = safe_str(tc.get("name")) or "required"
     elif isinstance(tc, str):
-        choice = tc
+        choice = "required" if tc in ("any", "required") else (tc if tc in ("auto", "none") else "auto")
 
     stops = body.get("stop_sequences")
     if not isinstance(stops, list):
@@ -554,6 +554,14 @@ def openai_to_canon(body: Dict[str, Any], cfg: Config) -> CanonRequest:
             tid = safe_str(nc.get("id")) or new_openai_call_id()
             id_to_name[tid] = nm
             calls.append(ToolCall(name=nm, args=parsed if isinstance(parsed, dict) else {}, id=tid))
+        legacy = raw.get("function_call")
+        if not calls and isinstance(legacy, dict) and safe_str(legacy.get("name")):
+            # Legacy `functions` API: the reply to it is keyed by name, not id.
+            nm = safe_str(legacy.get("name"))
+            args_raw = legacy.get("arguments")
+            parsed, _ = loads_tolerant(args_raw if isinstance(args_raw, str) else canon_json(args_raw))
+            id_to_name[nm] = nm
+            calls.append(ToolCall(name=nm, args=parsed if isinstance(parsed, dict) else {}, id=nm))
 
         messages.append(
             CanonMessage(
@@ -590,7 +598,7 @@ def openai_to_canon(body: Dict[str, Any], cfg: Config) -> CanonRequest:
     choice = "auto"
     tc = body.get("tool_choice")
     if isinstance(tc, str):
-        choice = tc if tc in ("auto", "none", "required") else "auto"
+        choice = "required" if tc == "any" else (tc if tc in ("auto", "none", "required") else "auto")
     elif isinstance(tc, dict):
         if tc.get("type") == "function":
             fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}

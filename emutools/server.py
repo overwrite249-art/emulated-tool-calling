@@ -16,6 +16,12 @@ class RequestError(ValueError):
 
 def validate_request(body: Dict[str, Any], protocol: str) -> None:
     """Reject malformed client values before conversion or starting a 200 stream."""
+    # The OpenAI API accepts explicit nulls for unset optional fields, and SDK
+    # wrappers send them; Anthropic does not, so keep rejecting them there.
+    if protocol == "openai":
+        for name in ("max_tokens", "max_completion_tokens", "stream", "parallel_tool_calls", "tool_choice"):
+            if name in body and body[name] is None:
+                del body[name]
     for name in ("max_tokens", "max_completion_tokens"):
         if name in body and (isinstance(body[name], bool) or not isinstance(body[name], int) or body[name] <= 0):
             raise RequestError(name + " must be a positive integer")
@@ -340,11 +346,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self._start_stream():
             return
-        if first is not None and not self._write_chunk(first):
-            return
-        for piece in source:
-            if not self._write_chunk(piece):
+        # Headers are sent: an exception must not reach do_POST, which would write a
+        # second HTTP response into the chunked body. Drop the connection without
+        # the terminating chunk so the client sees an interrupted stream.
+        try:
+            if first is not None and not self._write_chunk(first):
                 return
+            for piece in source:
+                if not self._write_chunk(piece):
+                    return
+        except Exception as exc:  # noqa: BLE001
+            log_error("stream aborted after headers: %s\n%s" % (exc, traceback.format_exc()))
+            self.close_connection = True
+            return
         self._end_chunks()
 
     def _handle_count_tokens(self, body: Dict[str, Any]) -> None:
