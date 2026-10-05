@@ -15,7 +15,14 @@ class RequestError(ValueError):
 
 
 def validate_request(body: Dict[str, Any], protocol: str) -> None:
-    """Reject malformed client values before conversion or starting a 200 stream."""
+    """Reject malformed client values before conversion or starting a 200 stream.
+
+    OpenAI clients (and the OpenAI API itself) treat an explicit top-level null as
+    "not set", so those keys are dropped in place; Anthropic stays strict.
+    """
+    if protocol == "openai":
+        for key in [k for k, v in body.items() if v is None and k != "messages"]:
+            del body[key]
     for name in ("max_tokens", "max_completion_tokens"):
         if name in body and (isinstance(body[name], bool) or not isinstance(body[name], int) or body[name] <= 0):
             raise RequestError(name + " must be a positive integer")
@@ -103,28 +110,72 @@ class Handler(BaseHTTPRequestHandler):
     def setup(self) -> None:
         super().setup()
         self.connection.settimeout(self.cfg.client_timeout)
+        set_thread_log_level(self.cfg.log_level)  # a server with its own Config logs at its level
+
+    def finish(self) -> None:
+        try:
+            super().finish()
+        finally:
+            set_thread_log_level(None)
 
     # ---------- low-level helpers ----------
 
     def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
         log_debug("%s %s" % (self.address_string(), fmt % args))
 
+    def _origin_allowed(self, origin: str) -> bool:
+        if not origin:
+            return True  # not a browser request
+        allowed = [o.strip() for o in (self.cfg.cors_origins or "").split(",") if o.strip()]
+        if "*" in allowed or origin in allowed:
+            return True
+        try:
+            host = urllib.parse.urlsplit(origin).hostname or ""
+        except ValueError:
+            return False
+        return host in _LOOPBACK_NAMES
+
+    def _guard(self, protocol: str) -> bool:
+        """Refuse cross-site browser requests and DNS-rebound Host headers."""
+        if (self.cfg.host or "").strip("[]") in _LOOPBACK_NAMES:
+            host = (self.headers.get("host") or "").strip()
+            if host.startswith("["):
+                host = host[1:].split("]", 1)[0]
+            else:
+                host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+            if host and host.lower() not in _LOOPBACK_NAMES:
+                self.close_connection = True
+                self._error(protocol, 403, "forbidden host header", "permission_error")
+                return False
+        if not self._origin_allowed(self.headers.get("origin") or ""):
+            self.close_connection = True
+            self._error(protocol, 403, "origin not allowed (set EMU_CORS_ORIGINS)", "permission_error")
+            return False
+        return True
+
     def _cors(self) -> None:
-        self.send_header("access-control-allow-origin", "*")
-        self.send_header("access-control-allow-headers", "*")
-        self.send_header("access-control-allow-methods", "GET,POST,OPTIONS")
+        origin = self.headers.get("origin") or ""
+        if origin and self._origin_allowed(origin):
+            self.send_header("access-control-allow-origin", origin)
+            self.send_header("vary", "origin")
+            self.send_header("access-control-allow-headers", "*")
+            self.send_header("access-control-allow-methods", "GET,POST,OPTIONS")
 
     def _send_json(self, status: int, obj: Dict[str, Any]) -> None:
-        raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        raw = utf8(json.dumps(obj, ensure_ascii=False))
         try:
             self.send_response(status)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(raw)))
+            if self.close_connection:
+                self.send_header("connection", "close")
             self._cors()
             self.end_headers()
-            self.wfile.write(raw)
+            if self.command != "HEAD":
+                self.wfile.write(raw)
             self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+        except OSError:
+            self.close_connection = True
             log_debug("client disconnected before response")
 
     def _start_stream(self) -> bool:
@@ -132,34 +183,47 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("content-type", "text/event-stream; charset=utf-8")
             self.send_header("cache-control", "no-cache, no-store")
-            self.send_header("connection", "keep-alive")
             self.send_header("x-accel-buffering", "no")
-            self.send_header("transfer-encoding", "chunked")
+            # HTTP/1.0 peers (e.g. nginx's default proxy_http_version) cannot take chunked.
+            self._chunked = self.request_version != "HTTP/1.0"
+            if self._chunked:
+                self.send_header("connection", "keep-alive")
+                self.send_header("transfer-encoding", "chunked")
+            else:
+                self.close_connection = True
+                self.send_header("connection", "close")
             self._cors()
             self.end_headers()
             return True
-        except (BrokenPipeError, ConnectionResetError):
+        except OSError:
+            self.close_connection = True
             return False
 
     def _write_chunk(self, data: bytes) -> bool:
         if not data:
             return True
         try:
-            self.wfile.write(("%x\r\n" % len(data)).encode("ascii"))
-            self.wfile.write(data)
-            self.wfile.write(b"\r\n")
+            if getattr(self, "_chunked", True):
+                self.wfile.write(("%x\r\n" % len(data)).encode("ascii"))
+                self.wfile.write(data)
+                self.wfile.write(b"\r\n")
+            else:
+                self.wfile.write(data)
             self.wfile.flush()
             return True
-        except (BrokenPipeError, ConnectionResetError):
-            log_info("client disconnected mid-stream")
+        except OSError:  # broken pipe, reset, or a stalled client timing out
+            self.close_connection = True
+            log_info("client disconnected or stalled mid-stream")
             return False
 
     def _end_chunks(self) -> None:
+        if not getattr(self, "_chunked", True):
+            return
         try:
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        except OSError:
+            self.close_connection = True
 
     def _read_body(self) -> Dict[str, Any]:
         lengths = self.headers.get_all("content-length", [])
@@ -201,7 +265,7 @@ class Handler(BaseHTTPRequestHandler):
                 chunks.append(chunk)
             raw = b"".join(chunks)
         else:
-            value = lengths[0] if lengths else "0"
+            value = (lengths[0] if lengths else "0").strip(" \t")
             if not re.fullmatch(r"[0-9]+", value):
                 raise RequestError("invalid content-length")
             length = int(value)
@@ -214,7 +278,7 @@ class Handler(BaseHTTPRequestHandler):
             def reject_constant(value: str) -> None:
                 raise ValueError("non-finite JSON number")
             data = json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
-        except (ValueError, UnicodeError) as exc:
+        except (ValueError, UnicodeError, RecursionError) as exc:
             raise RequestError("invalid JSON body") from exc
         if not isinstance(data, dict):
             raise RequestError("request body must be a JSON object")
@@ -232,7 +296,34 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- routes ----------
 
+    def _upstream_error(self, protocol: str, exc: "UpstreamError") -> None:
+        status = exc.status if exc.status >= 400 else 502
+        if status in (401, 403):
+            status = 502  # the proxy's upstream credential failed, not the client's key
+        detail = exc.message
+        try:
+            err = json.loads(exc.body).get("error")
+            msg = err.get("message") if isinstance(err, dict) else err
+            if isinstance(msg, str) and msg:
+                detail += ": " + msg
+        except Exception:  # noqa: BLE001
+            pass
+        self._error(protocol, status, detail, _ERROR_TYPES.get(status, "api_error"))
+
+    def _method_not_allowed(self) -> None:
+        path = self.path.split("?", 1)[0]
+        protocol = "anthropic" if path.startswith(("/v1/messages", "/messages")) else "openai"
+        self.close_connection = True
+        self._error(protocol, 405, "method %s not allowed" % self.command)
+
+    do_PUT = do_DELETE = do_PATCH = _method_not_allowed  # noqa: N815
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        self.do_GET()
+
     def do_OPTIONS(self) -> None:  # noqa: N802
+        if not self._guard("openai"):
+            return
         self.send_response(204)
         self._cors()
         self.send_header("content-length", "0")
@@ -240,6 +331,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        protocol = "anthropic" if path.startswith(("/v1/messages", "/messages")) else "openai"
+        if not self._guard(protocol):
+            return
         if path in ("/v1/models", "/models"):
             self._send_json(
                 200,
@@ -289,11 +383,17 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
             return
-        self._error("openai", 404, "unknown route %s" % path, "not_found_error")
+        self._error(protocol, 404, "unknown route %s" % path, "not_found_error")
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         protocol = "anthropic" if path.startswith(("/v1/messages", "/messages")) else "openai"
+        if not self._guard(protocol):
+            return
+        if path not in _POST_ROUTES:
+            self.close_connection = True  # body left unread
+            self._error(protocol, 404, "unknown route %s" % path, "not_found_error")
+            return
         try:
             body = self._read_body()
             if self.cfg.log_bodies:
@@ -313,7 +413,7 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             self._error(protocol, 408, "request body timed out")
         except UpstreamError as exc:
-            self._error(protocol, 502 if exc.status < 400 else exc.status, exc.message, "api_error")
+            self._upstream_error(protocol, exc)
         except (BrokenPipeError, ConnectionResetError):
             log_info("client disconnected")
         except Exception as exc:  # noqa: BLE001 - never kill the server
@@ -336,16 +436,38 @@ class Handler(BaseHTTPRequestHandler):
             first = None
         except UpstreamError as exc:
             log_error("stream refused: %s" % exc.message)
-            self._error(protocol, exc.status or 502, exc.message, "api_error")
+            self._upstream_error(protocol, exc)
             return
-        if not self._start_stream():
-            return
-        if first is not None and not self._write_chunk(first):
-            return
-        for piece in source:
-            if not self._write_chunk(piece):
+        try:
+            self._started_stream = False
+            if not self._start_stream():
                 return
-        self._end_chunks()
+            self._started_stream = True
+            if first is not None and not self._write_chunk(first):
+                return
+            for piece in source:
+                if not self._write_chunk(piece):
+                    return
+            self._end_chunks()
+        except Exception as exc:  # noqa: BLE001 - headers are out; never write a 2nd response
+            log_error("stream aborted after headers: %r" % (exc,))
+            self.close_connection = True
+            if getattr(self, "_started_stream", False):
+                msg = "internal error while streaming: %s" % type(exc).__name__
+                if protocol == "anthropic":
+                    event = sse("error", {"type": "error", "error": {"type": "api_error", "message": msg}})
+                else:
+                    event = utf8("data: %s\n\n" % json.dumps(
+                        {"error": {"message": msg, "type": "api_error", "code": 500}}))
+                if self._write_chunk(event):
+                    self._end_chunks()
+        finally:
+            close = getattr(source, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _handle_count_tokens(self, body: Dict[str, Any]) -> None:
         validate_request(body, "anthropic")
@@ -403,9 +525,23 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, openai_response(req, res))
 
 
+_LOOPBACK_NAMES = ("127.0.0.1", "localhost", "::1")
+_POST_ROUTES = (
+    "/v1/messages/count_tokens", "/messages/count_tokens",
+    "/v1/messages", "/messages",
+    "/v1/chat/completions", "/chat/completions",
+)
+_ERROR_TYPES = {
+    400: "invalid_request_error", 401: "authentication_error", 403: "permission_error",
+    404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error",
+    529: "overloaded_error",
+}
+
+
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 128  # the default of 5 resets bursts of parallel requests
 
     def __init__(self, server_address, RequestHandlerClass=Handler, bind_and_activate=True, cfg=None):
         self.cfg = cfg if cfg is not None else CFG
@@ -416,7 +552,7 @@ def serve(cfg: Config) -> None:
     if not cfg.upstream_key:
         log_warn("EMU_UPSTREAM_API_KEY is not set - upstream calls will likely fail with 401")
     httpd = Server((cfg.host, cfg.port), Handler, cfg=cfg)
-    log_info("emutools %s listening on http://%s:%d" % (__version__, cfg.host, cfg.port))
+    log_info("emutools %s listening on http://%s:%d" % (__version__, cfg.host, httpd.server_address[1]))
     log_info("upstream %s  big=%s  small=%s" % (_upstream_url(cfg), cfg.model_big, cfg.model_small))
     log_info("Claude Code : ANTHROPIC_BASE_URL=http://%s:%d ANTHROPIC_AUTH_TOKEN=dummy claude" % (cfg.host, cfg.port))
     log_info("OpenAI apps : OPENAI_BASE_URL=http://%s:%d/v1 OPENAI_API_KEY=dummy" % (cfg.host, cfg.port))

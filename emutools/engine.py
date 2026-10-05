@@ -62,7 +62,22 @@ def _call_issues(tc: ToolCall, req: CanonRequest, tools: Dict[str, ToolDef]) -> 
                 % (tc.name, ", ".join(sorted(tools)) or "(none)", hint)]
     if req.tool_choice not in ("auto", "required", "none", tc.name):
         return ["Tool `%s` is not the requested tool `%s`." % (tc.name, req.tool_choice)]
-    return ["Call to `%s` is invalid: %s." % (tc.name, issue) for issue in validate_args(tc.args, tools[tc.name].schema)]
+    issues = validate_args(tc.args, tools[tc.name].schema)
+    if _has_non_finite(tc.args) and not any("finite" in i for i in issues):
+        issues.append("arguments must not contain NaN or Infinity (not valid JSON)")
+    return ["Call to `%s` is invalid: %s." % (tc.name, issue) for issue in issues]
+
+
+def _has_non_finite(value: Any, depth: int = 0) -> bool:
+    if depth > 200:
+        return False
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, dict):
+        return any(_has_non_finite(v, depth + 1) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_non_finite(v, depth + 1) for v in value)
+    return False
 
 
 # A rejected call used to be reported to the user as the assistant's answer, which
@@ -76,6 +91,25 @@ RETRY_INSTRUCTION = (
     "text. Do not repeat your previous explanation. "
 )
 _MISSING_TOOL = "does not exist"
+
+# A call stopped by loop protection is not malformed, so "reply with only the
+# corrected tool call" (and a worked example of the very tool that was blocked)
+# would push the model straight back into the loop.
+LOOP_INSTRUCTION = (
+    "CRITICAL: Your previous tool call was blocked by loop protection and was NOT executed. "
+    "Do not repeat it; call a different tool, use different arguments, or give your "
+    "final answer in prose. "
+)
+_LOOP_MARKERS = ("You have already called `", "Blocked `", "Dropped a duplicate `")
+
+
+def _is_loop_reason(reason: str) -> bool:
+    return reason.startswith(_LOOP_MARKERS)
+
+TOOLS_DISABLED_REASON = (
+    "Tool calls are disabled for this turn, so your tool call was NOT executed. "
+    "Answer the user directly in prose, without any tool-call markup."
+)
 
 
 # An attempt that produces neither text nor a usable call is worse than a rejected
@@ -124,6 +158,8 @@ def _corrective_note(reasons: List[str], req: CanonRequest) -> str:
     corrective prompt has to restate the names it may actually use. Without this,
     three attempts are simply three identical rejections.
     """
+    if reasons and all(_is_loop_reason(r) for r in reasons):
+        return LOOP_INSTRUCTION + " ".join(reasons)
     note = RETRY_INSTRUCTION + " ".join(reasons)
     examples = [render_tool_example(t) for t in _named_tools(reasons, req)[:3]]
     if examples:
@@ -151,6 +187,7 @@ def run_turn(req: CanonRequest, cfg: Config) -> TurnResult:
     total_usage: Dict[str, Any] = {}
     max_attempts = 3 if cfg.loop_retry else 1
     wanted_call = False
+    seen_problems: List[str] = []
 
     for attempt in range(1, max_attempts + 1):
         payload = build_upstream_payload(req, cfg, extra, allow_tools)
@@ -165,6 +202,7 @@ def run_turn(req: CanonRequest, cfg: Config) -> TurnResult:
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 total_usage[key] = total_usage.get(key, 0) + value
         notes: List[str] = []
+        disabled_calls = bool(not allow_tools and calls)
         if not allow_tools and calls:
             notes.append("Tool calls are disabled for this turn (choice or conversation budget); ignored %d call(s)." % len(calls))
             calls = []
@@ -184,6 +222,8 @@ def run_turn(req: CanonRequest, cfg: Config) -> TurnResult:
         requires_call = allow_tools and req.tool_choice not in ("auto", "none")
         wanted_call = wanted_call or bool(problems)
         retry_reasons = list(problems)
+        if disabled_calls and not text.strip():
+            retry_reasons.append(TOOLS_DISABLED_REASON)
         if blocked and not kept:
             retry_reasons.extend(blocked)
         if requires_call and not kept:
@@ -192,6 +232,9 @@ def run_turn(req: CanonRequest, cfg: Config) -> TurnResult:
             retry_reasons.append(NO_CALL_REASON)
         if not kept and not retry_reasons and looks_like_botched_call(text):
             retry_reasons.append(BOTCHED_CALL_REASON)
+        for reason in retry_reasons:
+            if reason not in seen_problems:
+                seen_problems.append(reason)
         if retry_reasons and attempt < max_attempts:
             log_warn("retrying rejected tool output: %s" % retry_reasons[0][:160])
             extra = list(extra) + [_corrective_note(retry_reasons, req)]
@@ -211,7 +254,7 @@ def run_turn(req: CanonRequest, cfg: Config) -> TurnResult:
                 # itself asked for prose.
                 raise UpstreamError(
                     ("upstream produced no usable reply after %d attempt(s): " % attempt)
-                    + (" ".join(notes) if notes else "empty completion"),
+                    + (" ".join(notes or seen_problems) or "empty completion"),
                     529,
                 )
             text = "I stopped without executing the rejected tool call. " + " ".join(notes)
@@ -245,6 +288,7 @@ def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]
     loop_stopped = False
     payload: Dict[str, Any] = {}
 
+    resend_skip = ""
     for attempt in range(1, max_attempts + 1):
         last_attempt = attempt >= max_attempts
         payload = build_upstream_payload(req, cfg, extra + corrective, allow_tools)
@@ -253,11 +297,29 @@ def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]
         attempt_raw = 0
         attempt_usage = False
         attempt_text = ""
+        skip = resend_skip
+
+        def _dedupe(piece: str) -> str:
+            # A retry usually restates the preamble the client has already seen.
+            nonlocal skip
+            if not skip:
+                return piece
+            n, m = 0, min(len(piece), len(skip))
+            while n < m and piece[n] == skip[n]:
+                n += 1
+            if n == len(piece):
+                skip = skip[n:]
+                return ""
+            skip = ""
+            return piece[n:]
 
         def consider(tc: ToolCall) -> Iterator[Tuple[str, Any]]:
             nonlocal wanted_call, loop_stopped
             fp = tc.fp()
             if not allow_tools:
+                if not last_attempt:
+                    rejected.append(TOOLS_DISABLED_REASON)
+                    return
                 yield (
                     "text",
                     "\n\n[tool guard] Tool calls are disabled for this turn (choice or conversation budget).",
@@ -266,7 +328,8 @@ def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]
             issues = _call_issues(tc, req, tools_by_name)
             if issues:
                 wanted_call = True
-                if req.tool_choice not in ("auto", "none", "required") and tc.name != req.tool_choice:
+                if (last_attempt and req.tool_choice not in ("auto", "none", "required")
+                        and tc.name != req.tool_choice):
                     raise UpstreamError("model did not call the requested tool `%s`" % req.tool_choice, 502)
                 if last_attempt:
                     # Out of attempts. Say nothing: explaining the rejection here
@@ -335,8 +398,12 @@ def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]
                     break  # stop paying for output that cannot be used
                 for out in held:
                     if out[0] == "text":
-                        any_text = True
                         attempt_text += out[1]
+                        piece = _dedupe(out[1])
+                        if not piece:
+                            continue
+                        any_text = any_text or bool(piece.strip())
+                        out = ("text", piece)
                     yield out
                 held = []
 
@@ -357,6 +424,7 @@ def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]
                 log_debug("RAW attempt %d: %s"
                           % (attempt, truncate_middle("".join(seen_raw), 4000)))
 
+        held_text = "".join(v for k, v in held if k == "text")
         requires_call = allow_tools and req.tool_choice not in ("auto", "none")
         if not rejected and requires_call and not emitted_calls and not last_attempt:
             rejected.append(
@@ -366,27 +434,31 @@ def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]
         if not rejected and not emitted_calls and not last_attempt:
             if wanted_call:
                 rejected.append(NO_CALL_REASON)
-            elif not any_text:
+            elif not any_text and not held_text.strip():
                 rejected.append(EMPTY_REPLY_REASON)
-            elif looks_like_botched_call(attempt_text):
+            elif looks_like_botched_call(attempt_text + held_text):
                 rejected.append(BOTCHED_CALL_REASON)
+        if not attempt_usage and (rejected or emitted_calls or held or attempt_raw):
+            usage_total["prompt_tokens"] = usage_total.get("prompt_tokens", 0) + _estimate_input_tokens(payload)
+            usage_total["completion_tokens"] = usage_total.get("completion_tokens", 0) + estimate_tokens("x" * attempt_raw)
+            usage_reported = True
         if rejected and not emitted_calls:
             # Abandoning the stream early saves output tokens, but the tokens already
             # produced were still billed, so estimate them instead of losing them.
-            if not attempt_usage:
-                usage_total["prompt_tokens"] = (
-                    usage_total.get("prompt_tokens", 0) + _estimate_input_tokens(payload))
-                usage_total["completion_tokens"] = (
-                    usage_total.get("completion_tokens", 0) + estimate_tokens("x" * attempt_raw))
-                usage_reported = True
             log_warn("retrying rejected streamed tool output: %s" % rejected[0][:160])
             corrective = [_corrective_note(rejected, req)]
+            # The client already saw this attempt's text; don't stream it twice.
+            resend_skip = attempt_text
             held = []
             continue
         for out in held:
             if out[0] == "text":
-                any_text = True
                 attempt_text += out[1]
+                piece = _dedupe(out[1])
+                if not piece:
+                    continue
+                any_text = any_text or bool(piece.strip())
+                out = ("text", piece)
             yield out
         held = []
         break
@@ -457,7 +529,7 @@ def anthropic_response(req: CanonRequest, res: TurnResult) -> Dict[str, Any]:
 
 
 def sse(event: str, data: Dict[str, Any]) -> bytes:
-    return ("event: %s\ndata: %s\n\n" % (event, json.dumps(data, ensure_ascii=False))).encode("utf-8")
+    return utf8("event: %s\ndata: %s\n\n" % (event, json.dumps(data, ensure_ascii=False)))
 
 
 def anthropic_stream_bytes(req: CanonRequest, cfg: Config) -> Iterator[bytes]:
@@ -490,6 +562,7 @@ def anthropic_stream_bytes(req: CanonRequest, cfg: Config) -> Iterator[bytes]:
 
     index = 0
     text_open = False
+    pending_ws = ""
     usage: Dict[str, Any] = {}
     finish = "stop"
     out_chars = 0
@@ -504,6 +577,12 @@ def anthropic_stream_bytes(req: CanonRequest, cfg: Config) -> Iterator[bytes]:
         for kind, value in replay():
             if kind == "text":
                 if not text_open:
+                    # Never open a block just for the "\n" between parallel calls.
+                    value = pending_ws + value
+                    pending_ws = ""
+                    if not value.strip():
+                        pending_ws = value
+                        continue
                     yield sse(
                         "content_block_start",
                         {
@@ -523,6 +602,7 @@ def anthropic_stream_bytes(req: CanonRequest, cfg: Config) -> Iterator[bytes]:
                     },
                 )
             elif kind == "call":
+                pending_ws = ""
                 if text_open:
                     yield sse("content_block_stop", {"type": "content_block_stop", "index": index})
                     text_open = False
@@ -637,7 +717,7 @@ def openai_stream_bytes(req: CanonRequest, cfg: Config, include_usage: bool) -> 
             "model": model,
             "choices": [{"index": 0, "delta": delta, "logprobs": None, "finish_reason": finish}],
         }
-        return ("data: %s\n\n" % json.dumps(obj, ensure_ascii=False)).encode("utf-8")
+        return utf8("data: %s\n\n" % json.dumps(obj, ensure_ascii=False))
 
     turn = run_turn_stream(req, cfg)
     try:
@@ -697,7 +777,7 @@ def openai_stream_bytes(req: CanonRequest, cfg: Config, include_usage: bool) -> 
     except UpstreamError as exc:
         log_error("stream failed: %s" % exc.message)
         error = {"error": {"message": exc.message, "type": "api_error", "code": exc.status}}
-        yield ("data: %s\n\n" % json.dumps(error)).encode("utf-8")
+        yield utf8("data: %s\n\n" % json.dumps(error))
         return
 
     yield chunk({}, finish)
@@ -715,7 +795,7 @@ def openai_stream_bytes(req: CanonRequest, cfg: Config, include_usage: bool) -> 
             "choices": [],
             "usage": u,
         }
-        yield ("data: %s\n\n" % json.dumps(obj, ensure_ascii=False)).encode("utf-8")
+        yield utf8("data: %s\n\n" % json.dumps(obj, ensure_ascii=False))
 
     yield b"data: [DONE]\n\n"
 

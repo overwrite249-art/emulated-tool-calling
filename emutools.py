@@ -53,10 +53,11 @@ import threading
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 __version__ = "1.0.0"
 
@@ -66,9 +67,16 @@ __version__ = "1.0.0"
 # ======================================================================================
 
 
+def _env_warn(msg: str) -> None:
+    # Config is built before the logger exists, so warn straight to stderr.
+    sys.stderr.write("emutools: warning: %s\n" % msg)
+
+
 def _env(name: str, default: str = "") -> str:
     v = os.environ.get(name)
-    return default if v is None else v
+    if v is None or v.strip() == "":
+        return default
+    return v.strip()
 
 
 def _env_int(name: str, default: int) -> int:
@@ -76,8 +84,9 @@ def _env_int(name: str, default: int) -> int:
         raw = os.environ.get(name)
         if raw is None or raw.strip() == "":
             return default
-        return int(raw)
+        return int(raw.strip())
     except (TypeError, ValueError):
+        _env_warn("%s=%r is not an integer; using %s" % (name, raw, default))
         return default
 
 
@@ -86,16 +95,39 @@ def _env_float(name: str, default: float) -> float:
         raw = os.environ.get(name)
         if raw is None or raw.strip() == "":
             return default
-        return float(raw)
+        v = float(raw.strip())
     except (TypeError, ValueError):
+        _env_warn("%s=%r is not a number; using %s" % (name, raw, default))
         return default
+    if not math.isfinite(v) or v <= 0:
+        _env_warn("%s=%r is not a positive finite number; using %s" % (name, raw, default))
+        return default
+    return v
 
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None or raw.strip() == "":
         return default
-    return raw.strip().lower() in ("1", "true", "yes", "on", "y")
+    low = raw.strip().lower()
+    if low in ("1", "true", "yes", "on", "y", "enabled", "enable"):
+        return True
+    if low in ("0", "false", "no", "off", "n", "disabled", "disable"):
+        return False
+    _env_warn("%s=%r is not a boolean; using %s" % (name, raw, default))
+    return default
+
+
+_LOG_LEVEL_NAMES = ("debug", "info", "warn", "error", "silent")
+
+
+def _normalize_log_level(raw: str) -> str:
+    low = (raw or "").strip().lower()
+    low = {"warning": "warn", "err": "error", "quiet": "silent", "none": "silent"}.get(low, low)
+    if low not in _LOG_LEVEL_NAMES:
+        _env_warn("EMU_LOG=%r is not one of %s; using info" % (raw, "/".join(_LOG_LEVEL_NAMES)))
+        return "info"
+    return low
 
 
 @dataclass
@@ -137,16 +169,32 @@ class Config:
     timeout: float = field(default_factory=lambda: _env_float("EMU_TIMEOUT", 300.0))
     connect_retries: int = field(default_factory=lambda: _env_int("EMU_MAX_RETRIES", 3))
 
-    log_level: str = field(default_factory=lambda: _env("EMU_LOG", "info").lower())
+    # Browser origins allowed to call the proxy (comma-separated; "*" for any).
+    # Loopback origins are always allowed. Everything else is refused so a web page
+    # cannot spend the upstream key through the local proxy.
+    cors_origins: str = field(default_factory=lambda: _env("EMU_CORS_ORIGINS", ""))
+
+    log_level: str = field(default_factory=lambda: _normalize_log_level(_env("EMU_LOG", "info")))
     log_bodies: bool = field(default_factory=lambda: _env_bool("EMU_LOG_BODIES", False))
 
     def model_map(self) -> Dict[str, str]:
+        raw = self.model_map_raw
+        cache = self.__dict__.get("_model_map_cache")
+        if cache is not None and cache[0] == raw:
+            return dict(cache[1])
+        parsed = self._parse_model_map()
+        self.__dict__["_model_map_cache"] = (raw, parsed)
+        return dict(parsed)
+
+    def _parse_model_map(self) -> Dict[str, str]:
         if not self.model_map_raw.strip():
             return {}
         raw = self.model_map_raw.strip()
         if not raw.startswith("{"):
             mapping: Dict[str, str] = {}
             for item in raw.split(","):
+                if not item.strip():
+                    continue
                 key, sep, value = item.partition("=")
                 if not sep or not key.strip() or not value.strip():
                     log_warn("EMU_MODEL_MAP must be JSON or comma-separated from=to pairs; ignoring")
@@ -167,14 +215,17 @@ class Config:
         if requested in mapping:
             return mapping[requested]
         low = requested.lower()
-        for key, val in mapping.items():
+        # Most specific (longest) key wins for partial matches.
+        for key in sorted(mapping, key=len, reverse=True):
             if key.lower() in low:
-                return val
+                return mapping[key]
         # Already an upstream id? pass through untouched.
         if low.startswith("deepseek") or low.startswith("qwen") or low.startswith("glm"):
             return requested
         # Small/fast tier used by Claude Code for titles & cheap classification.
-        if any(tok in low for tok in ("haiku", "mini", "small", "flash", "fast", "lite")):
+        # Whole tokens only: "mini" must not match inside "gemini" or "minimax".
+        toks = set(t for t in re.split(r"[^a-z0-9]+", low) if t)
+        if toks & {"haiku", "mini", "small", "flash", "fast", "lite"}:
             return self.model_small
         return self.model_big
 
@@ -185,8 +236,17 @@ _LEVELS = {"debug": 10, "info": 20, "warn": 30, "error": 40, "silent": 100}
 _LOG_LOCK = threading.Lock()
 
 
+_LOG_LOCAL = threading.local()
+
+
+def set_thread_log_level(level: Optional[str]) -> None:
+    """Let a server thread log at its own Config's level (None = global CFG)."""
+    _LOG_LOCAL.level = level
+
+
 def _log(level: str, msg: str) -> None:
-    if _LEVELS.get(level, 20) < _LEVELS.get(CFG.log_level, 20):
+    current = getattr(_LOG_LOCAL, "level", None) or CFG.log_level
+    if _LEVELS.get(level, 20) < _LEVELS.get(current, 20):
         return
     line = "%s [%s] %s" % (time.strftime("%H:%M:%S"), level.upper()[:4], msg)
     with _LOG_LOCK:
@@ -256,12 +316,23 @@ def estimate_tokens(text: str) -> int:
 def truncate_middle(text: str, limit: int) -> str:
     if limit <= 0 or len(text) <= limit:
         return text
-    head = limit // 2
-    tail = limit - head - 40
-    if tail < 0:
-        tail = 0
+    marker_len = len("\n... [%d characters omitted] ...\n" % len(text))
+    if limit <= marker_len:
+        return text[:limit]
+    budget = limit - marker_len
+    head = budget // 2
+    tail = budget - head
     omitted = len(text) - head - tail
     return text[:head] + ("\n... [%d characters omitted] ...\n" % omitted) + (text[-tail:] if tail else "")
+
+
+def utf8(text: str) -> bytes:
+    """UTF-8 encode, repairing lone surrogates (e.g. from JSON "\\ud83d") instead of raising."""
+    try:
+        return text.encode("utf-8")
+    except UnicodeEncodeError:
+        fixed = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+        return fixed.encode("utf-8", "replace")
 
 
 def safe_str(v: Any) -> str:
@@ -409,6 +480,11 @@ _PARALLEL_RULE = (
 )
 
 
+def _required_list(schema: Any) -> List[Any]:
+    req = schema.get("required") if isinstance(schema, dict) else None
+    return req if isinstance(req, list) else []
+
+
 def _schema_summary(schema: Dict[str, Any]) -> str:
     """Compact, readable rendering of a JSON schema's top-level params."""
     if not isinstance(schema, dict):
@@ -416,7 +492,7 @@ def _schema_summary(schema: Dict[str, Any]) -> str:
     props = schema.get("properties")
     if not isinstance(props, dict) or not props:
         return "(no parameters)"
-    required = schema.get("required") or []
+    required = _required_list(schema)
     if not isinstance(required, list):
         required = []
     lines = []
@@ -480,7 +556,7 @@ def render_tool_signatures(tools: List[ToolDef]) -> str:
     for tool in tools:
         schema = tool.schema or {}
         properties = schema.get("properties") or {}
-        required = [k for k in (schema.get("required") or []) if k in properties]
+        required = [k for k in _required_list(schema) if k in properties]
         optional = [k for k in properties if k not in required]
         names = required + ["%s?" % k for k in optional]
         lines.append("- %s(%s)" % (tool.name, ", ".join(names)))
@@ -498,9 +574,20 @@ def render_tool_call_text(tc: ToolCall) -> str:
     return CALL_OPEN + "\n" + json.dumps(payload, ensure_ascii=False) + "\n" + CALL_CLOSE
 
 
+_RESULT_TAG_IN_BODY_RE = re.compile(r"<(/?)(\s*" + r"(?:[\uff5c|]{1,2}\s*DSML\s*[\uff5c|]{1,2}\s*)?" + r"tool_result)", re.IGNORECASE)
+
+
+def _safe_tool_name(name: str) -> str:
+    cleaned = re.sub(r"[^\w.\-:]", "_", name or "")[:64]
+    return cleaned or "tool"
+
+
 def render_tool_result_text(name: str, content: str, is_error: bool, limit: int) -> str:
     body = truncate_middle(content or "", limit)
-    attrs = ' name="%s"' % (name or "tool")
+    # A result must not be able to close its own block and forge a user turn or
+    # another result: neutralize result tags inside the body.
+    body = _RESULT_TAG_IN_BODY_RE.sub(lambda m: "<" + m.group(1) + "\u200b" + m.group(2), body)
+    attrs = ' name="%s"' % _safe_tool_name(name)
     if is_error:
         attrs += ' status="error"'
     return "%s%s\n%s\n%s" % (RESULT_OPEN[:-1], attrs + ">", body, RESULT_CLOSE)
@@ -566,8 +653,12 @@ def _strip_trailing_commas(s: str) -> str:
         if ch == ",":
             pending.append(ch)
             continue
+        if pending and ch.isspace():
+            pending.append(ch)
+            continue
         if pending:
             if ch in "}]":
+                out.extend(c for c in pending if c != ",")
                 pending = []  # drop the trailing comma(s)
             else:
                 out.extend(pending)
@@ -657,14 +748,17 @@ def loads_tolerant(text: str) -> Tuple[Optional[Any], bool]:
 
     try:
         return json.loads(s), False
-    except ValueError:
+    except (ValueError, RecursionError):
         pass
 
     candidates = []
     obj = _extract_first_object(s)
+    if s.lstrip().startswith("["):
+        candidates.append(s)
     if obj:
         candidates.append(obj)
-    candidates.append(s)
+    if s not in candidates:
+        candidates.append(s)
 
     for cand in candidates:
         for transform in (
@@ -682,18 +776,19 @@ def loads_tolerant(text: str) -> Tuple[Optional[Any], bool]:
                 continue
             try:
                 return json.loads(fixed), True
-            except ValueError:
+            except (ValueError, RecursionError):
                 continue
 
     # Last resort: single-quoted pseudo-JSON.
-    try:
-        import ast
+    import ast
 
-        val = ast.literal_eval(s if not obj else obj)
-        if isinstance(val, (dict, list)):
-            return json.loads(json.dumps(val, default=str)), True
-    except Exception:  # noqa: BLE001
-        pass
+    for cand in ([obj] if obj else []) + [s]:
+        try:
+            val = ast.literal_eval(cand)
+            if isinstance(val, (dict, list)):
+                return json.loads(json.dumps(val, default=str)), True
+        except Exception:  # noqa: BLE001
+            pass
     return None, False
 
 
@@ -715,11 +810,107 @@ OPEN_TAG_NAMES = [
 _TAGS_ALT = "|".join(re.escape(t) for t in OPEN_TAG_NAMES)
 # Recognize vendor sentinels at syntax boundaries, never rewrite argument data.
 _VENDOR = r"(?:(?:\uff5c{1,2}|\|{1,2})\s*DSML\s*(?:\uff5c{1,2}|\|{1,2})\s*)?"
-_OPEN_RE = re.compile(r"<" + _VENDOR + r"(" + _TAGS_ALT + r")(\s[^>]*?)?\s*/?>", re.IGNORECASE)
+_OPEN_HEAD_RE = re.compile(r"<[ \t]?" + _VENDOR + r"(" + _TAGS_ALT + r")(?=[\s/>])", re.IGNORECASE)
+
+
+class _TagMatch:
+    __slots__ = ("_start", "_end", "_groups")
+
+    def __init__(self, start: int, end: int, whole: str, name: str, attrs: Optional[str]) -> None:
+        self._start, self._end = start, end
+        self._groups = (whole, name, attrs)
+
+    def start(self) -> int:
+        return self._start
+
+    def end(self) -> int:
+        return self._end
+
+    def group(self, i: int = 0) -> Any:
+        return self._groups[i]
+
+
+_DS_CALL_TAG = "\u2581ds_call"
+_DS_SEP = r"[\u2581_\- ]?"
+_DS_BEGIN_RE = re.compile(r"<[\uff5c|]{1,2}\s*tool" + _DS_SEP + r"call" + _DS_SEP + r"begin\s*[\uff5c|]{1,2}>", re.IGNORECASE)
+_DS_END_RE = re.compile(r"<[\uff5c|]{1,2}\s*tool" + _DS_SEP + r"call" + _DS_SEP + r"end\s*[\uff5c|]{1,2}>", re.IGNORECASE)
+_DS_HEAD_RE = re.compile(
+    r"\A\s*(?:function)?\s*<?[\uff5c|]{1,2}\s*tool" + _DS_SEP + r"sep\s*[\uff5c|]{1,2}>?\s*([\w.\-:]{1,64})\s*",
+    re.IGNORECASE)
+
+
+class _OpenTagFinder:
+    """`<tool_call ...>` finder in linear time.
+
+    The old single regex (`(\\s[^>]*?)?\\s*/?>`) backtracked quadratically, and worse,
+    on model text such as `'<tool_call ' * 4000`.
+    """
+
+    def search(self, text: str, pos: int = 0) -> Optional[_TagMatch]:
+        tag = self._search(text, pos)
+        if "tool" in text and ("\uff5c" in text or "|" in text):
+            ds = _DS_BEGIN_RE.search(text, pos)
+            if ds and (tag is None or ds.start() < tag.start()):
+                # DeepSeek's native '<｜tool▁call▁begin｜>function<｜tool▁sep｜>Name'
+                return _TagMatch(ds.start(), ds.end(), ds.group(0), _DS_CALL_TAG, None)
+        return tag
+
+    def _search(self, text: str, pos: int = 0) -> Optional[_TagMatch]:
+        while True:
+            head = _OPEN_HEAD_RE.search(text, pos)
+            if not head:
+                return None
+            gt = text.find(">", head.end())
+            if gt < 0:
+                return None  # no later tag can be closed either
+            middle = text[head.end():gt]
+            if middle and not middle[0].isspace() and middle != "/":
+                pos = head.end()
+                continue
+            attrs = middle[:-1] if middle.endswith("/") else middle
+            return _TagMatch(head.start(), gt + 1, text[head.start():gt + 1], head.group(1),
+                             attrs if attrs.strip() else None)
+
+
+_OPEN_RE = _OpenTagFinder()
 _ATTR_RE = re.compile(r"([A-Za-z_:][-\w:.]*)\s*=\s*(\"([^\"]*)\"|'([^']*)')")
 _ARG_RE = re.compile(
     r"<" + _VENDOR + r"(arg|parameter|param)(\s[^>]*?)?\s*>(.*?)</" + _VENDOR + r"\1\s*>", re.IGNORECASE | re.DOTALL
 )
+_ARG_HEAD_RE = re.compile(r"<" + _VENDOR + r"(arg|parameter|param)(?=[\s>])", re.IGNORECASE)
+
+
+def _arg_elements(text: str) -> List[Tuple[int, int, str, Optional[str], str]]:
+    """(start, end, tag, raw attrs, value) for each complete argument element.
+
+    Linear replacement for `_ARG_RE.finditer`, which rescanned to the end of the
+    text for every unclosed `<arg>` (quadratic on `'<arg>' * 16000`).
+    """
+    out: List[Tuple[int, int, str, Optional[str], str]] = []
+    no_close_after: Dict[str, int] = {}
+    pos = 0
+    while True:
+        head = _ARG_HEAD_RE.search(text, pos)
+        if not head:
+            return out
+        gt = text.find(">", head.end())
+        if gt < 0:
+            return out
+        tag = head.group(1).lower()
+        attrs = text[head.end():gt]
+        if tag in no_close_after and gt >= no_close_after[tag]:
+            pos = gt + 1
+            continue
+        close = re.compile(r"</" + _VENDOR + re.escape(tag) + r"\s*>", re.IGNORECASE).search(text, gt + 1)
+        if not close:
+            no_close_after[tag] = gt
+            pos = gt + 1
+            continue
+        out.append((head.start(), close.end(), head.group(1), attrs if attrs.strip() else None,
+                    text[gt + 1:close.start()]))
+        pos = close.end()
+
+
 _RESULT_BLOCK_RE = re.compile(
     r"<tool_result\b[^>]*>.*?</tool_result\s*>", re.IGNORECASE | re.DOTALL
 )
@@ -789,7 +980,7 @@ _PIPES = r"(?:[\uff5c|]{1,2}\s*)?"
 # not a '>' is allowed after the name, exactly as in a real tag's attribute list.
 _VENDOR_TAG_RE = re.compile(
     r"</?\s*" + _PIPES + r"(?:" + "|".join(_sentinel_pattern(n) for n in _WRAPPER_NAMES)
-    + r")(?:\s+[^<>]{0,120}?)?\s*" + _PIPES + r"/?>",
+    + r")(?:\s[^<>]{0,120})?" + _PIPES + r"/?>",
     re.IGNORECASE,
 )
 # The same wrapper written bare, with no angle brackets: '｜tool▁calls▁begin｜'.
@@ -798,9 +989,9 @@ _BARE_SENTINEL_NAMES = tuple(n for n in _WRAPPER_NAMES if n != "calls")
 # whole run of names in one go instead of letting the first match eat the pipe that
 # opens the next one and strand its name as visible text.
 _BARE_SENTINEL_RE = re.compile(
-    r"(?:[\uff5c|]{1,2}\s*(?:"
+    r"(?:(?:\uff5c{1,2}\s*|\|{1,2})(?:"
     + "|".join(_sentinel_pattern(n) for n in _BARE_SENTINEL_NAMES)
-    + r")\s*)+[\uff5c|]{1,2}",
+    + r")(?:\s*(?=\uff5c)|(?=\|)))+[\uff5c|]{1,2}",
     re.IGNORECASE,
 )
 
@@ -870,7 +1061,7 @@ def split_vendor_markup(text: str) -> Tuple[str, str, bool]:
     """
     if not text:
         return text, "", False
-    if _ENDS_WITH_SENTINEL_RE.search(text):
+    if _ENDS_WITH_SENTINEL_RE.search(text[-400:]):
         # Keep one pipe: the next chunk may attach the name of the next sentinel to
         # it. A pipe left over at the true end of the message is dropped on flush.
         if text[-1] in ("\uff5c", "|"):
@@ -916,7 +1107,12 @@ STREAM_SENTINELS = (
         "</\uff5c\uff5cdsml\uff5c\uff5c",
         "<||dsml||",
         "</||dsml||",
+        "<\uff5cdsml\uff5c",
+        "</\uff5cdsml\uff5c",
+        "<|dsml|",
+        "</|dsml|",
     ]
+    + ["< " + t for t in OPEN_TAG_NAMES]
 )
 _MAX_SENTINEL = max(len(s) for s in STREAM_SENTINELS)
 _FENCE_TAIL_RE = re.compile(r"(?:^|\n)`{1,3}[a-zA-Z0-9_+-]*[ \t]*\n?$")
@@ -933,6 +1129,7 @@ _UNCLOSED_CALL_TAG_RE = re.compile(
 # Any orphan closing tag that reads like a call terminator, however the model spelled
 # it. Live, a turn ended with a bare '</_call>' as the assistant's answer.
 _ANY_CLOSE_RE = re.compile(r"</\s*([\w:.\-\u2581\uff5c|]{1,40})\s*>")
+_CALL_CLOSE_COMPOUNDS = ("toolcall", "toolcalls", "functioncall", "functioncalls", "tooluse", "dsmlinvoke")
 _CALL_CLOSE_SUFFIXES = (
     "call", "calls", "invoke", "arg", "args", "parameter", "param", "function",
     "tooluse", "toolcalls",
@@ -943,11 +1140,13 @@ def looks_like_botched_call(text: str) -> bool:
     """True when visible text contains tool-call markup but no call was parsed."""
     if not text:
         return False
+    text = re.sub(r"```.*?(?:```|\Z)|`[^`\n]*`", "", text, flags=re.DOTALL)
     if _ARG_ELEMENT_RE.search(text) or _UNCLOSED_CALL_TAG_RE.search(text):
         return True
     for match in _ANY_CLOSE_RE.finditer(text):
-        key = re.sub(r"[^a-z]", "", match.group(1).lower())
-        if key.endswith(_CALL_CLOSE_SUFFIXES):
+        name = match.group(1).lower().split(":")[-1]
+        key = re.sub(r"[^a-z]", "", name)
+        if key in _CALL_CLOSE_SUFFIXES or key.endswith(_CALL_CLOSE_COMPOUNDS):
             return True
     return False
 
@@ -965,15 +1164,23 @@ def _parse_attrs(raw: Optional[str]) -> Dict[str, str]:
 
 def _find_close(text: str, tag: str, start: int) -> Tuple[int, int]:
     """Find syntax, not a closing tag embedded in JSON or raw argument data."""
-    close_re = re.compile(r"</\s*" + _VENDOR + re.escape(tag) + r"\s*>", re.IGNORECASE)
-    body = strip_fences(text[start:]).lstrip()
+    close_re = (_DS_END_RE if tag == _DS_CALL_TAG
+                else re.compile(r"</\s*" + _VENDOR + re.escape(tag) + r"\s*>", re.IGNORECASE))
+    body = re.sub(r"^\s*```[a-zA-Z0-9_+-]*[ \t]*\n", "", text[start:]).lstrip()
     is_json = body.startswith(("{", "["))
+    # Quote state (JSON form) and open argument elements (raw form) are tracked
+    # incrementally; rescanning the segment for every candidate close was quadratic.
+    quote = ""
+    escaped = False
+    scanned = start
+    heads: List[int] = []
+    ends: List[int] = []
+    heads_ready = False
+    hi = 0
+    max_end = -1
     for match in close_re.finditer(text, start):
-        segment = text[start:match.start()]
         if is_json:
-            quote = ""
-            escaped = False
-            for ch in segment:
+            for ch in text[scanned:match.start()]:
                 if escaped:
                     escaped = False
                 elif quote and ch == "\\":
@@ -982,13 +1189,22 @@ def _find_close(text: str, tag: str, start: int) -> Tuple[int, int]:
                     quote = ""
                 elif not quote and ch in ("\"", "'"):
                     quote = ch
+            scanned = match.start()
             if quote:
                 continue
         else:
-            opens = len(re.findall(r"<" + _VENDOR + r"(?:arg|parameter|param)\b", segment, re.IGNORECASE))
-            closes = len(re.findall(r"</" + _VENDOR + r"(?:arg|parameter|param)\s*>", segment, re.IGNORECASE))
-            if opens > closes:
-                continue
+            if not heads_ready:  # only paid once a candidate close exists
+                heads_ready = True
+                elements = {e[0]: e[1] for e in _arg_elements(text[start:])}
+                for h in _ARG_HEAD_RE.finditer(text, start):
+                    rel = h.start() - start
+                    heads.append(h.start())
+                    ends.append(start + elements[rel] if rel in elements else len(text) + 1)
+            while hi < len(heads) and heads[hi] < match.start():
+                max_end = max(max_end, ends[hi])
+                hi += 1
+            if max_end > match.start():
+                continue  # inside an argument value
         return match.start(), match.end()
     return -1, -1
 
@@ -1020,7 +1236,7 @@ def _coerce_scalar(value: str, ptype: Any) -> Any:
         parsed, _ = loads_tolerant(stripped)
         if isinstance(parsed, (list, dict)):
             return parsed
-    if "null" in types and stripped.lower() in ("null", "none", ""):
+    if "null" in types and (stripped.lower() in ("null", "none") or (stripped == "" and "string" not in types)):
         return None
     if not types or types == ["any"]:
         parsed, _ = loads_tolerant(stripped)
@@ -1050,7 +1266,8 @@ def coerce_args(args: Dict[str, Any], schema: Optional[Dict[str, Any]]) -> Dict[
             out[key] = _coerce_scalar(val, ptype)
         elif isinstance(val, (int, float)) and not isinstance(val, bool):
             types = ptype if isinstance(ptype, list) else [ptype]
-            if "string" in [str(t).lower() for t in types]:
+            lowered = [str(t).lower() for t in types]
+            if "string" in lowered and not {"number", "integer"} & set(lowered):
                 out[key] = str(val)
     return out
 
@@ -1069,6 +1286,8 @@ def validate_args(args: Dict[str, Any], schema: Optional[Dict[str, Any]]) -> Lis
             return [path + " exceeds schema validation depth"]
         if spec is False:
             return [path + " is not allowed"]
+        if isinstance(value, float) and not math.isfinite(value):
+            return [path + " must be a finite number"]
         if not isinstance(spec, dict):
             return []
         errors: List[str] = []
@@ -1100,7 +1319,7 @@ def validate_args(args: Dict[str, Any], schema: Optional[Dict[str, Any]]) -> Lis
             "array": isinstance(value, list),
             "object": isinstance(value, dict),
         }
-        if types and not any(predicates.get(t, True) for t in types):
+        if types and not any(predicates.get(t, True) if isinstance(t, str) else True for t in types):
             return errors + [path + " must be " + "|".join(map(str, types))]
         def same(a: Any, b: Any) -> bool:
             if isinstance(a, bool) != isinstance(b, bool):
@@ -1251,7 +1470,7 @@ def _rename_target(key: str, props: Dict[str, Any], taken: Iterable[str]) -> Opt
         if low in lowered:
             return lowered[low]
         flat = re.sub(r"[^a-z0-9]", "", low)
-        if flat in plain:
+        if flat and flat in plain:
             return plain[flat]
     close = difflib.get_close_matches(key.lower(), list(lowered), n=1, cutoff=0.82)
     if close:
@@ -1300,7 +1519,7 @@ def repair_args(
         strays.remove(key)
         changed = True
 
-    required = [name for name in (schema.get("required") or []) if isinstance(name, str)]
+    required = [name for name in _required_list(schema) if isinstance(name, str)]
     missing = [name for name in required if name not in out]
     if len(missing) == 1 and len(strays) == 1:
         out[missing[0]] = out.pop(strays[0])
@@ -1308,7 +1527,7 @@ def repair_args(
         changed = True
 
     extra = schema.get("additionalProperties")
-    if strays and extra is not True:
+    if strays and extra is not True and not isinstance(extra, dict):
         for key in strays:
             out.pop(key, None)
         changed = True
@@ -1319,7 +1538,7 @@ def render_tool_example(tool: ToolDef) -> str:
     """One correct call for `tool`, to show a model what it got wrong."""
     schema = tool.schema if isinstance(tool.schema, dict) else {}
     props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
-    required = [n for n in (schema.get("required") or []) if isinstance(n, str) and n in props]
+    required = [n for n in _required_list(schema) if isinstance(n, str) and n in props]
     names = required or list(props)[:2]
     example: Dict[str, Any] = {}
     for name in names:
@@ -1412,7 +1631,7 @@ def args_only_tool(
     for tool in tools_by_name.values():
         schema = tool.schema if isinstance(tool.schema, dict) else {}
         props = schema.get("properties")
-        required = {n for n in (schema.get("required") or []) if isinstance(n, str)}
+        required = {n for n in _required_list(schema) if isinstance(n, str)}
         if not isinstance(props, dict) or not props or not required:
             continue
         if keys <= set(props) and required <= keys:
@@ -1459,24 +1678,53 @@ _ENVELOPE_ONLY_KEYS = frozenset(
 )
 
 
-def _bare_call_envelope(text: str, tools_by_name: Dict[str, ToolDef]) -> Optional[ToolCall]:
-    """Parse `text` as a bare call envelope, registered tool or not."""
+# Names a coding model plausibly means as a call even when the client did not
+# register that tool (so the call reaches the rejection/retry path, not the user).
+_COMMON_TOOL_NAMES = frozenset({
+    "read", "write", "edit", "multiedit", "bash", "shell", "grep", "glob", "ls",
+    "todowrite", "webfetch", "websearch", "task", "str_replace_editor", "create_file",
+    "run_command", "execute", "execute_command", "read_file", "write_file", "apply_patch",
+})
+
+
+def _plausible_tool_name(name: str, tools_by_name: Dict[str, ToolDef]) -> bool:
+    low = name.lower()
+    if low in {k.lower() for k in tools_by_name} or low in _COMMON_TOOL_NAMES:
+        return True
+    return bool(difflib.get_close_matches(low, [k.lower() for k in tools_by_name], n=1, cutoff=0.6))
+
+
+def _bare_call_envelope(
+    text: str, tools_by_name: Dict[str, ToolDef], whole: bool = True,
+    allow_implied: Optional[bool] = None,
+) -> Optional[ToolCall]:
+    """Parse `text` as a bare call envelope, registered tool or not.
+
+    `whole` says the object is the entire reply. A nameless argument object, or an
+    envelope naming something that is not remotely a tool, only counts then: in the
+    middle of prose it is far more likely an example (`{"name": "Widget", ...}`) or
+    quoted data than a call.
+    """
     parsed, _repaired = loads_tolerant(text)
     if not isinstance(parsed, dict):
         return None
     inner_fn = parsed.get("function") if isinstance(parsed.get("function"), dict) else {}
     name = ""
     for key in _BARE_CALL_KEYS:
-        value = inner_fn.get("name") if key == "function" else parsed.get(key)
+        value = (inner_fn.get("name") if inner_fn else parsed.get(key)) if key == "function" else parsed.get(key)
         if isinstance(value, str) and value:
             name = value
             break
     if not name:
+        if not (whole if allow_implied is None else allow_implied):
+            return None
         implied = args_only_tool(parsed, tools_by_name)
         if implied:
             return _build_call(implied, parsed, text, True, tools_by_name)
         return None
     if set(parsed) - _ENVELOPE_ONLY_KEYS:
+        return None
+    if not whole and not _plausible_tool_name(name, tools_by_name):
         return None
     args = None
     for source in (parsed, inner_fn):
@@ -1510,20 +1758,50 @@ def bare_call_starts(
             yield start
 
 
+def _open_depth(text: str) -> int:
+    depth = 0
+    for _i, ch, in_str in _walk_strings(text):
+        if not in_str and ch in "[{":
+            depth += 1
+        elif not in_str and ch in "]}" and depth:
+            depth -= 1
+    return depth
+
+
 def find_bare_call(
     text: str,
     tools_by_name: Dict[str, ToolDef],
     at_line_start: bool = True,
     extra: Optional[Tuple[str, ...]] = None,
+    context: str = "",
 ) -> Optional[Tuple[int, int, ToolCall]]:
-    """Find the first line-leading bare JSON call. Returns (start, end, call)."""
+    """Find the first line-leading bare JSON call. Returns (start, end, call).
+
+    `context` is text already shown before `text` (streaming), so a fence or
+    prose that preceded this chunk still counts.
+    """
     if extra is None:
         extra = argument_key_prefixes(tools_by_name)
+    off = len(context)
+    full = context + text
+    spans = literal_spans(full)
     for start in bare_call_starts(text, at_line_start, extra):
         end = json_object_end(text, start)
         if end < 0:
-            continue
-        call = _bare_call_envelope(text[start:end], tools_by_name)
+            # Everything after an unclosed object is inside it; scanning on would
+            # be quadratic on '{"name"\n' * 4000.
+            return None
+        if _in_spans(spans, off + start):
+            continue  # inside a code block the model is showing
+        if _open_depth(text[:start]) > 0:
+            continue  # nested inside an enclosing array/object: data, not a call
+        fenced = _FENCE_OPEN_TAIL_RE.search(full[:off + start]) is not None
+        trailing = not re.sub(r"\A\s*`{3}[ \t]*", "", text[end:]).strip()
+        whole = trailing and not full[:_fence_backoff(full, off + start)].strip()
+        # A nameless argument object only counts when it ends the reply unfenced
+        # ("Let me inspect it.\n{...}"); a fenced or mid-text one is shown data.
+        call = _bare_call_envelope(text[start:end], tools_by_name, whole=whole,
+                                   allow_implied=whole or (trailing and not fenced))
         if call is not None:
             return start, end, call
     return None
@@ -1565,26 +1843,33 @@ def parse_call_body(
 ) -> Optional[ToolCall]:
     """Turn the inside of a <tool_call> block into a ToolCall."""
     raw = body
-    body = strip_fences(body)
     name = attrs.get("name") or attrs.get("tool") or attrs.get("function") or ""
+    ds = _DS_HEAD_RE.match(body) if not name else None
+    if ds:
+        name = ds.group(1)
+        body = body[ds.end():]
+    body = strip_fences(body)
 
     # Raw <arg name="...">...</arg> form.
-    arg_matches = [] if body.lstrip().startswith(("{", "[")) else list(_ARG_RE.finditer(body))
+    arg_matches = [] if body.lstrip().startswith(("{", "[")) else _arg_elements(body)
     if arg_matches:
         args: Dict[str, Any] = {}
         for m in arg_matches:
-            a_attrs = _parse_attrs(m.group(2))
+            a_attrs = _parse_attrs(m[3])
             key = a_attrs.get("name") or a_attrs.get("key")
             if not key:
                 continue
-            val = m.group(3)
+            val = m[4]
             if val.startswith("\n"):
                 val = val[1:]
             if val.endswith("\n"):
                 val = val[:-1]
             args[key] = val
         if not name:
-            leading = body[: arg_matches[0].start()].strip()
+            leading = body[: arg_matches[0][0]].strip()
+            hermes = re.fullmatch(r"<name>\s*([\w.\-:]{1,64})\s*</name>", leading, re.IGNORECASE)
+            if hermes:
+                leading = hermes.group(1)
             parsed, _ = loads_tolerant(leading)
             if isinstance(parsed, dict):
                 name = safe_str(parsed.get("name"))
@@ -1616,8 +1901,12 @@ def parse_call_body(
                 repaired = repaired or rep2
             else:
                 pargs = {"value": pargs}
+        if pargs is None and name:
+            # The tag already names the tool: the body is the argument object itself.
+            pargs = parsed
+            pname = ""
         if pargs is None:
-            if name or pname:
+            if pname:
                 leftovers = {
                     k: v
                     for k, v in parsed.items()
@@ -1645,14 +1934,148 @@ def parse_call_body(
     return None
 
 
-def strip_hallucinated_results(text: str) -> str:
-    """Delete any <tool_result> the model wrote itself - it is always fabricated."""
-    cleaned = _RESULT_BLOCK_RE.sub("", text)
-    cleaned = _ORPHAN_RESULT_RE.sub("", cleaned)
-    return cleaned
+def json_end_cover(text: str, pos: int, at: int) -> int:
+    """End of the furthest bare-call object starting before `at`, else `at`."""
+    best = at
+    for start in bare_call_starts(text[pos:at]):
+        end = json_object_end(text, pos + start)
+        if end > best:
+            best = end
+    return best
+
+
+
+# Code the model is *showing* is never a call: inline code spans and code fences in
+# a language other than the few a model uses to (wrongly) fence a real call. Without
+# this, a README quoted from a tool result - `<tool_call>{"name":"Bash",...}` - was
+# executed as a real call.
+_RESULT_CLOSE_RE = re.compile(r"</" + _VENDOR + r"tool_result\s*>", re.IGNORECASE)
+_CALLABLE_FENCE_LANGS = frozenset({"", "json", "jsonc", "json5", "xml", "tool_call", "tool_code"})
+_FENCE_LINE_RE = re.compile(r"[ \t]*(`{3,}|~{3,})[ \t]*([^\s`]*)")
+
+
+def literal_spans(text: str) -> List[Tuple[int, int]]:
+    """Sorted (start, end) spans of `text` that are code shown to the reader."""
+    spans: List[Tuple[int, int]] = []
+    fence: Optional[Tuple[str, int, bool]] = None  # (marker, start, literal)
+    pos = 0
+    n = len(text)
+    while pos <= n:
+        nl = text.find("\n", pos)
+        end = n if nl < 0 else nl
+        line = text[pos:end]
+        fm = _FENCE_LINE_RE.match(line)
+        if fm:
+            marker = fm.group(1)
+            if fence is None:
+                fence = (marker[0] * 3, pos, fm.group(2).lower() not in _CALLABLE_FENCE_LANGS)
+            elif marker.startswith(fence[0]) and not fm.group(2):
+                if fence[2]:
+                    spans.append((fence[1], end))
+                fence = None
+        elif fence is None and "`" in line:
+            i = 0
+            while True:
+                a = line.find("`", i)
+                if a < 0:
+                    break
+                k = a
+                while k < len(line) and line[k] == "`":
+                    k += 1
+                run = line[a:k]
+                b = line.find(run, k)
+                while b >= 0 and b + len(run) < len(line) and line[b + len(run)] == "`":
+                    b = line.find(run, b + len(run) + 1)
+                if b < 0:
+                    spans.append((pos + a, pos + len(line)))  # still open: rest of line
+                    break
+                spans.append((pos + a, pos + b + len(run)))
+                i = b + len(run)
+        if nl < 0:
+            break
+        pos = nl + 1
+    if fence is not None and fence[2]:
+        spans.append((fence[1], n))
+    spans.sort()
+    return spans
+
+
+def _in_spans(spans: List[Tuple[int, int]], idx: int) -> bool:
+    lo, hi = 0, len(spans)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if spans[mid][0] <= idx:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo > 0 and spans[lo - 1][0] <= idx < spans[lo - 1][1]
+
+
+def _result_is_fabricated(text: str, idx: int, spans: List[Tuple[int, int]]) -> bool:
+    """A model-written <tool_result> starts a line (or directly follows a tag).
+
+    One mentioned mid-sentence - "results come back as <tool_result> blocks" - is
+    prose, and treating it as fabricated used to delete the rest of the answer.
+    """
+    if _in_spans(spans, idx):
+        return False
+    line_start = text.rfind("\n", 0, idx) + 1
+    before = text[line_start:idx].strip()
+    if not before or before.endswith(">"):
+        return True
+    # Mid-sentence it is fabricated only if it really is a block with a body.
+    return _RESULT_CLOSE_RE.search(text, idx) is not None
+
+
+def _next_live_open(text: str, pos: int, spans: List[Tuple[int, int]], prefix: str = "") -> Optional[Any]:
+    """`spans` are for `prefix + text`; `prefix` is the already-shown line start."""
+    off = len(prefix)
+    while True:
+        m = _OPEN_RE.search(text, pos)
+        if not m or not _in_spans(spans, off + m.start()):
+            return m
+        pos = m.start() + 1
+
+
+def _next_live_result(text: str, pos: int, spans: List[Tuple[int, int]], prefix: str = "") -> Optional[Any]:
+    off = len(prefix)
+    full = prefix + text if prefix else text
+    while True:
+        m = _RESULT_OPEN_RE.search(text, pos)
+        if not m or _result_is_fabricated(full, off + m.start(), spans):
+            return m
+        pos = m.start() + 1
+
+
+
+def strip_hallucinated_results(text: str, prefix: str = "") -> str:
+    """Delete any <tool_result> the model wrote itself - it is always fabricated.
+
+    A block is removed up to its closing tag; an unclosed one takes the rest of the
+    text with it. Linear (the old regexes were quadratic on repeated open tags), and
+    results mentioned in prose or code are left alone.
+    """
+    if not text or "tool_result" not in text.lower():
+        return text
+    spans = literal_spans(prefix + text)
+    out: List[str] = []
+    pos = 0
+    while True:
+        m = _next_live_result(text, pos, spans, prefix)
+        if not m:
+            out.append(text[pos:])
+            break
+        out.append(text[pos:m.start()])
+        close = _RESULT_CLOSE_RE.search(text, m.end())
+        if not close:
+            break
+        pos = close.end()
+    return "".join(out)
 
 
 def _clean_trailing_fence(text: str) -> str:
+    if len(re.findall(r"(?m)^[ \t]*`{3}", text)) % 2 == 0:
+        return text  # every fence is closed: the last one belongs to the prose
     return re.sub(r"(?:^|\n)`{3}[a-zA-Z0-9_+-]*[ \t]*\n?\s*$", "\n", text)
 
 
@@ -1660,13 +2083,20 @@ def extract_tool_calls(
     text: str,
     tools_by_name: Dict[str, ToolDef],
     salvage: bool = True,
+    context: str = "",
 ) -> Tuple[str, List[ToolCall]]:
-    """Split model output into (visible text, tool calls)."""
+    """Split model output into (visible text, tool calls).
+
+    `context` is text already shown before `text` (a streaming tail), so a bare
+    object is not mistaken for the whole reply.
+    """
     if not text:
         return "", []
+    sole = not context.strip()
     # A bare call must be recognized before scanning its JSON string values.
     candidate = strip_fences(text)
-    if salvage and candidate.startswith("{") and len(candidate) < 20000:
+    if (salvage and sole and candidate.startswith("{") and len(candidate) < 20000
+            and json_object_end(candidate, 0) == len(candidate)):
         call = _bare_call_envelope(candidate, tools_by_name)
         if call:
             return "", [call]
@@ -1674,17 +2104,29 @@ def extract_tool_calls(
     calls: List[ToolCall] = []
     out_parts: List[str] = []
     pos = 0
+    ctx_line = context[context.rfind("\n") + 1:]
+    spans = literal_spans(ctx_line + text)
 
     while True:
-        m = _OPEN_RE.search(text, pos)
-        result = re.search(r"<" + _VENDOR + r"tool_result\b[^>]*>", text[pos:], re.IGNORECASE)
-        if result and (not m or pos + result.start() < m.start()):
+        m = _next_live_open(text, pos, spans, ctx_line)
+        result = _next_live_result(text, pos, spans, ctx_line)
+        if result and (not m or result.start() < m.start()):
             # Everything after a fabricated result depends on a tool that never ran.
-            out_parts.append(text[pos:pos + result.start()])
+            out_parts.append(text[pos:result.start()])
+            pos = len(text)
             break
         if not m:
             out_parts.append(text[pos:])
             break
+        if salvage:
+            # A tag inside a bare call's JSON string is argument data, not syntax.
+            found = find_bare_call(text[pos:json_end_cover(text, pos, m.start())], tools_by_name,
+                                   context=context + text[:pos])
+            if found:
+                out_parts.append(text[pos:pos + found[0]])
+                calls.append(found[2])
+                pos += found[1]
+                continue
         tag = m.group(1)
         attrs = _parse_attrs(m.group(2))
         # Self-closing tag with everything in attributes.
@@ -1703,6 +2145,9 @@ def extract_tool_calls(
             call = parse_call_body(text[m.end() :], attrs, tools_by_name)
             if call:
                 calls.append(call)
+            else:
+                # Not a call after all ("models write <tool_call> tags"): keep the prose.
+                out_parts.append(text[m.start():])
             pos = len(text)
             break
 
@@ -1713,14 +2158,15 @@ def extract_tool_calls(
         pos = c_end
 
     visible = strip_vendor_markup("".join(out_parts))
-    visible = strip_hallucinated_results(visible)
+    visible = strip_hallucinated_results(visible, ctx_line)
     if calls:
         visible = _clean_trailing_fence(visible)
 
     # Salvage: a bare JSON call object with no tags at all.
-    if not calls and salvage:
+    if not calls and salvage and sole:
         candidate = strip_fences(visible)
-        if candidate.startswith("{") and len(candidate) < 20000:
+        if (candidate.startswith("{") and len(candidate) < 20000
+                and json_object_end(candidate, 0) == len(candidate)):
             call = _bare_call_envelope(candidate, tools_by_name)
             if call:
                 calls.append(call)
@@ -1731,13 +2177,16 @@ def extract_tool_calls(
         kept: List[str] = []
         rest = visible
         while True:
-            found = find_bare_call(rest, tools_by_name)
+            found = find_bare_call(rest, tools_by_name, context=context + "".join(kept))
             if not found:
                 break
             start, end, call = found
+            fenced = _FENCE_OPEN_TAIL_RE.search(rest[:start]) is not None
             kept.append(rest[:start])
             calls.append(call)
             rest = rest[end:]
+            if fenced:
+                rest = re.sub(r"\A[ \t]*\n?[ \t]*`{3}[ \t]*(?=\n|\Z)", "", rest)
         if calls:
             visible = _clean_trailing_fence("".join(kept)) + rest
 
@@ -1776,6 +2225,63 @@ class StreamToolParser:
         # the middle of a sentence or nested inside another object.
         self.at_line_start = True
         self.arg_prefixes = argument_key_prefixes(tools_by_name)
+        self.call_open_raw = ""
+        # Set after a fenced bare call: its closing fence belongs to the call.
+        self.drop_fence_close = False
+
+    def _strip_results(self, text: str) -> str:
+        """strip_hallucinated_results, judged in the context of the open line."""
+        line = self.text_emitted[self.text_emitted.rfind("\n") + 1:]
+        return strip_hallucinated_results(text, line[-4000:])
+
+    def _drop_fence_close(self) -> bool:
+        """Eat the fence that closes a fenced bare call. True = wait for more text."""
+        stripped = self.buf.lstrip(" \t\r\n")
+        if stripped.startswith("```"):
+            nl = stripped.find("\n")
+            if nl < 0 and stripped.strip("`").strip():
+                self.drop_fence_close = False
+                return False
+            if nl < 0:
+                return True
+            self.buf = stripped[nl:]
+            self.drop_fence_close = False
+            return False
+        if not stripped or "```".startswith(stripped):
+            return True
+        self.drop_fence_close = False
+        return False
+
+    def _live_tags(self) -> Tuple[Any, Any, Any]:
+        """(open tag, fabricated result, undecided result) in `buf`, code excluded.
+
+        Emitted text is part of the context: an inline code span or code fence that
+        opened in an earlier chunk still makes a tag in this one literal.
+        """
+        m = _OPEN_RE.search(self.buf)
+        raw_result = _RESULT_OPEN_RE.search(self.buf)
+        if not m and not raw_result:
+            return None, None, None
+        ctx = self.text_emitted[-20000:]
+        full = ctx + self.buf
+        off = len(ctx)
+        spans = literal_spans(full)
+        while m and _in_spans(spans, off + m.start()):
+            m = _OPEN_RE.search(self.buf, m.start() + 1)
+        result = pending = None
+        r = raw_result
+        while r:
+            idx = off + r.start()
+            if not _in_spans(spans, idx):
+                line_start = full.rfind("\n", 0, idx) + 1
+                before = full[line_start:idx].strip()
+                if not before or before.endswith(">") or _RESULT_CLOSE_RE.search(self.buf, r.end()):
+                    result = r
+                else:
+                    pending = r  # mid-sentence: fabricated only if a close tag follows
+                break
+            r = _RESULT_OPEN_RE.search(self.buf, r.start() + 1)
+        return m, result, pending
 
     @staticmethod
     def _holdback_len(buf: str) -> int:
@@ -1845,6 +2351,7 @@ class StreamToolParser:
         """
         if len(buf) > 200000:
             return 0
+        full = len(buf)
         stop = len(buf)
         for pattern in (_OPEN_RE, _RESULT_OPEN_RE):
             hit = pattern.search(buf)
@@ -1853,7 +2360,7 @@ class StreamToolParser:
         buf = buf[:stop]
         for start in bare_call_starts(buf, self.at_line_start, self.arg_prefixes):
             if json_object_end(buf, start) < 0:
-                return len(buf) - _fence_backoff(buf, start)
+                return full - _fence_backoff(buf, start)
         return 0
 
     def feed(self, delta: str) -> List[str]:
@@ -1869,6 +2376,8 @@ class StreamToolParser:
             if len(self.buf) > 1 and not _maybe_bare_sentinel(self.buf):
                 self.buf = self.buf[1:]
                 self.sentinel_tail = False
+        if self.drop_fence_close and self._drop_fence_close():
+            return []
         # Do not leak a bare JSON call as text before salvaging it at EOF.
         if (self.salvage and not self.text_emitted and not self.calls and not self.in_call
                 and strip_fences(self.buf).lstrip().startswith("{") and len(self.buf) < 20000):
@@ -1891,29 +2400,51 @@ class StreamToolParser:
                 self.at_line_start = True
                 continue
 
-            m = _OPEN_RE.search(self.buf)
-            result = re.search(r"<" + _VENDOR + r"tool_result\b[^>]*>", self.buf, re.IGNORECASE)
+            m, result, pending = self._live_tags()
+            if pending and (not m or pending.start() < m.start()) and not result:
+                # Hold everything from an undecided mid-sentence <tool_result> on;
+                # finish() or a later close tag decides.
+                head = self.buf[:pending.start()]
+                if head:
+                    self._emit(out, self._strip_results(strip_vendor_markup(head)))
+                self.buf = self.buf[pending.start():]
+                break
 
             # A wrapped call, or a hallucinated result, always wins over a bare JSON
             # object: the object may simply be this call's own argument block.
             limit = len(self.buf)
+            if m and self.salvage:
+                # A tag inside an open bare call's JSON string is data, not syntax.
+                for s0 in bare_call_starts(self.buf[:m.start()], self.at_line_start,
+                                           self.arg_prefixes):
+                    e0 = json_object_end(self.buf, s0)
+                    if e0 < 0 or e0 > m.start():
+                        m = None
+                        if result and result.start() < max(e0, len(self.buf)):
+                            result = None
+                        break
             if m:
                 limit = min(limit, m.start())
             if result:
                 limit = min(limit, result.start())
             if self.salvage and limit and limit < 200000:
                 found = find_bare_call(self.buf[:limit], self.tools_by_name,
-                                       self.at_line_start, self.arg_prefixes)
+                                       self.at_line_start, self.arg_prefixes,
+                                       context=self.text_emitted[-4000:])
                 if found:
                     start, end, call = found
                     head = strip_vendor_markup(self.buf[:start])
+                    if _FENCE_OPEN_TAIL_RE.search(self.buf[:start]):
+                        self.drop_fence_close = True
                     if not self.saw_any_call and not self.calls:
                         head = _clean_trailing_fence(head)
-                    self._emit(out, strip_hallucinated_results(head))
+                    self._emit(out, self._strip_results(head))
                     self.calls.append(call)
                     self.saw_any_call = True
                     self.buf = self.buf[end:]
                     self.at_line_start = True
+                    if self.drop_fence_close and self._drop_fence_close():
+                        break
                     continue
             if result and (not m or result.start() < m.start()):
                 self._emit(out, strip_vendor_markup(self.buf[:result.start()]))
@@ -1924,7 +2455,7 @@ class StreamToolParser:
                 head = strip_vendor_markup(self.buf[: m.start()])
                 if self.saw_any_call is False and not self.calls:
                     head = _clean_trailing_fence(head)
-                self._emit(out, strip_hallucinated_results(head))
+                self._emit(out, self._strip_results(head))
                 self.at_line_start = True
                 self.call_tag = m.group(1)
                 self.call_attrs = _parse_attrs(m.group(2))
@@ -1936,6 +2467,7 @@ class StreamToolParser:
                     self.buf = self.buf[m.end() :]
                     continue
                 self.in_call = True
+                self.call_open_raw = m.group(0)
                 self.buf = self.buf[m.end() :]
                 continue
 
@@ -1955,7 +2487,7 @@ class StreamToolParser:
             emit = self.buf[: len(self.buf) - hold] if hold else self.buf
             self.buf = self.buf[len(self.buf) - hold :] if hold else ""
             if emit:
-                self._emit(out, strip_hallucinated_results(strip_vendor_markup(emit)))
+                self._emit(out, self._strip_results(strip_vendor_markup(emit)))
             break
 
         return out
@@ -1969,11 +2501,23 @@ class StreamToolParser:
             if call:
                 self.calls.append(call)
                 self.saw_any_call = True
+            else:
+                # Never closed and not a call: it was prose mentioning the tag.
+                self._emit(out, self._strip_results(self.call_open_raw + body))
             self.buf = ""
             self.in_call = False
         elif self.buf:
+            if self.drop_fence_close and self.buf.strip(" \t\r\n`") == "":
+                self.buf = ""
+            line_ctx = self.text_emitted[self.text_emitted.rfind("\n") + 1:]
+            if line_ctx.strip() and _RESULT_OPEN_RE.match(self.buf):
+                # An undecided mid-sentence result: judge it with its line.
+                cleaned = self._strip_results(line_ctx + self.buf)
+                self.buf = cleaned[len(line_ctx):] if cleaned.startswith(line_ctx) else ""
+        if self.buf and not self.in_call:
             if self.salvage:
-                visible, salvaged = extract_tool_calls(self.buf, self.tools_by_name, salvage=True)
+                visible, salvaged = extract_tool_calls(self.buf, self.tools_by_name, salvage=True,
+                                                       context=self.text_emitted[-4000:])
                 if salvaged:
                     self.calls.extend(salvaged)
                     self.saw_any_call = True
@@ -1982,7 +2526,7 @@ class StreamToolParser:
                     return out, self.calls
             if self.sentinel_tail and self.buf.strip("\uff5c| \t\r\n") == "":
                 self.buf = ""
-            tail = strip_hallucinated_results(strip_vendor_markup(self.buf))
+            tail = self._strip_results(strip_vendor_markup(self.buf))
             if self.calls:
                 tail = _clean_trailing_fence(tail)
             if tail.strip():
@@ -2144,14 +2688,24 @@ def _upstream_url(cfg: Config) -> str:
 
 
 def _do_request(cfg: Config, payload: Dict[str, Any], stream: bool):
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    body = utf8(json.dumps(payload, ensure_ascii=False))
     req = urllib.request.Request(_upstream_url(cfg), data=body, method="POST")
     req.add_header("content-type", "application/json")
     req.add_header("accept", "text/event-stream" if stream else "application/json")
     req.add_header("user-agent", "emutools/%s" % __version__)
     if cfg.upstream_key:
         req.add_header("authorization", "Bearer " + cfg.upstream_key)
-    return urllib.request.urlopen(req, timeout=cfg.timeout)
+    return _OPENER.open(req, timeout=cfg.timeout)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow upstream redirects: a 30x would re-POST the bearer key elsewhere."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect())
 
 
 def _request_with_retries(cfg: Config, payload: Dict[str, Any], stream: bool):
@@ -2176,6 +2730,12 @@ def _request_with_retries(cfg: Config, payload: Dict[str, Any], stream: bool):
                 time.sleep(delay)
                 last = UpstreamError("upstream %s" % exc.code, exc.code, text)
                 continue
+            if 300 <= exc.code < 400:
+                raise UpstreamError(
+                    "upstream redirected (HTTP %s) to %s; redirects are not followed, point the "
+                    "upstream base URL at the final address" % (exc.code, exc.headers.get("location", "?")),
+                    502,
+                )
             raise UpstreamError(
                 "upstream returned HTTP %s" % exc.code, exc.code, truncate_middle(text, 2000)
             )
@@ -2198,7 +2758,9 @@ def upstream_complete(cfg: Config, payload: Dict[str, Any]) -> Dict[str, Any]:
     payload["stream"] = False
     resp = _request_with_retries(cfg, payload, stream=False)
     try:
-        raw = resp.read()
+        raw = resp.read(_MAX_UPSTREAM_BYTES + 1)
+        if len(raw) > _MAX_UPSTREAM_BYTES:
+            raise UpstreamError("upstream response exceeds %d bytes" % _MAX_UPSTREAM_BYTES, 502)
     except (OSError, http.client.HTTPException) as exc:
         raise UpstreamError("upstream response interrupted: %s" % exc, 502) from exc
     finally:
@@ -2221,6 +2783,10 @@ def upstream_complete(cfg: Config, payload: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
+_MAX_UPSTREAM_BYTES = 64 * 1024 * 1024
+_NEWLINE_RE = re.compile(r"\r\n|\r(?=.)|\n", re.DOTALL)
+
+
 def iter_sse(resp) -> Iterator[Dict[str, Any]]:
     """Decode UTF-8 incrementally and dispatch complete SSE events, not lines.
 
@@ -2230,7 +2796,9 @@ def iter_sse(resp) -> Iterator[Dict[str, Any]]:
     decoder = codecs.getincrementaldecoder("utf-8-sig")("strict")
     read = getattr(resp, "read1", None) or resp.read
     buf = ""
+    scan = 0  # buf[:scan] is known to hold no line break
     fields: List[str] = []
+    event_size = 0
     eof = False
     while not eof:
         raw = read(4096)
@@ -2239,11 +2807,17 @@ def iter_sse(resp) -> Iterator[Dict[str, Any]]:
             buf += decoder.decode(raw, final=eof)
         except UnicodeError as exc:
             raise UpstreamError("upstream SSE is not valid UTF-8", 502) from exc
+        if len(buf) > _MAX_UPSTREAM_BYTES or event_size > _MAX_UPSTREAM_BYTES:
+            raise UpstreamError("upstream SSE event exceeds %d bytes" % _MAX_UPSTREAM_BYTES, 502)
         while True:
             # Hold a trailing CR until the next read: it may be half of CRLF.
-            newline = re.search(r"\r\n|\r(?=.)|\n", buf, re.DOTALL)
+            newline = _NEWLINE_RE.search(buf, scan)
             if newline:
                 line, buf = buf[:newline.start()], buf[newline.end():]
+                scan = 0
+            elif not eof:
+                scan = max(0, len(buf) - 1)
+                break
             elif eof and buf:
                 line, buf = buf.rstrip("\r"), ""
             elif eof and fields:
@@ -2255,6 +2829,7 @@ def iter_sse(resp) -> Iterator[Dict[str, Any]]:
                     continue
                 data = "\n".join(fields)
                 fields = []
+                event_size = 0
                 if data.strip() == "[DONE]":
                     return
                 if not data.strip():
@@ -2270,6 +2845,7 @@ def iter_sse(resp) -> Iterator[Dict[str, Any]]:
                 name, _, value = line.partition(":")
                 if name == "data":
                     fields.append(value[1:] if value.startswith(" ") else value)
+                    event_size += len(fields[-1])
 
 
 def upstream_stream(cfg: Config, payload: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
@@ -2279,6 +2855,39 @@ def upstream_stream(cfg: Config, payload: Dict[str, Any]) -> Iterator[Dict[str, 
     payload["stream_options"] = {"include_usage": True}
     resp = _request_with_retries(cfg, payload, stream=True)
     saw_finish = False
+    last_usage: Optional[Dict[str, Any]] = None
+    native: Dict[int, Dict[str, str]] = {}
+
+    def _flush_native() -> Iterator[Dict[str, Any]]:
+        # Native streamed tool_calls are folded into the emulated text form.
+        for i in sorted(native):
+            nc = native[i]
+            parsed, _ = loads_tolerant(nc["args"] or "{}")
+            yield {"text": "\n" + CALL_OPEN + "\n" + json.dumps(
+                {"name": nc["name"], "arguments": parsed if isinstance(parsed, dict) else {}},
+                ensure_ascii=False,
+            ) + "\n" + CALL_CLOSE}
+        native.clear()
+
+    held = {"text": "", "reasoning": ""}
+
+    def _piece(kind: str, chunk: str) -> Iterator[Dict[str, Any]]:
+        # Re-pair UTF-16 surrogates split across chunks (JSON "\\ud83d" + "\\ude00").
+        chunk = held[kind] + chunk
+        held[kind] = ""
+        if chunk and "\ud800" <= chunk[-1] <= "\udbff":
+            held[kind], chunk = chunk[-1], chunk[:-1]
+        if chunk:
+            chunk = chunk.encode("utf-16", "surrogatepass").decode("utf-16", "replace") if any(
+                "\ud800" <= c <= "\udfff" for c in chunk) else chunk
+            yield {kind: chunk}
+
+    def _release() -> Iterator[Dict[str, Any]]:
+        for kind in ("reasoning", "text"):
+            if held[kind]:
+                held[kind] = ""
+                yield {kind: "\ufffd"}
+
     try:
         for obj in iter_sse(resp):
             if not isinstance(obj, dict):
@@ -2289,7 +2898,8 @@ def upstream_stream(cfg: Config, payload: Dict[str, Any]) -> Iterator[Dict[str, 
                 raise UpstreamError("upstream stream error: %s" % msg, 502)
             usage = obj.get("usage")
             if isinstance(usage, dict):
-                yield {"usage": usage}
+                # Some upstreams send running totals on every chunk; keep the last.
+                last_usage = usage
             choices = obj.get("choices")
             if not isinstance(choices, list) or not choices:
                 continue
@@ -2300,21 +2910,41 @@ def upstream_stream(cfg: Config, payload: Dict[str, Any]) -> Iterator[Dict[str, 
             if isinstance(delta, dict):
                 rc = delta.get("reasoning_content") or delta.get("reasoning")
                 if isinstance(rc, str) and rc:
-                    yield {"reasoning": rc}
+                    yield from _piece("reasoning", rc)
                 content = delta.get("content")
                 if isinstance(content, str) and content:
-                    yield {"text": content}
+                    yield from _piece("text", content)
                 elif isinstance(content, list):
                     for part in content:
                         if isinstance(part, dict) and isinstance(part.get("text"), str):
-                            yield {"text": part["text"]}
+                            yield from _piece("text", part["text"])
+                for tcd in delta.get("tool_calls") or []:
+                    if not isinstance(tcd, dict):
+                        continue
+                    try:
+                        idx = int(tcd.get("index") or 0)
+                    except (TypeError, ValueError):
+                        idx = 0
+                    slot = native.setdefault(idx, {"name": "", "args": ""})
+                    fn = tcd.get("function") if isinstance(tcd.get("function"), dict) else {}
+                    slot["name"] += safe_str(fn.get("name"))
+                    a = fn.get("arguments")
+                    slot["args"] += a if isinstance(a, str) else (canon_json(a) if a is not None else "")
             msgobj = ch.get("message")
             if isinstance(msgobj, dict) and isinstance(msgobj.get("content"), str):
-                yield {"text": msgobj["content"]}
+                yield from _piece("text", msgobj["content"])
             fr = ch.get("finish_reason")
             if fr:
+                yield from _release()
+                for ev in _flush_native():
+                    yield ev
                 saw_finish = True
                 yield {"finish": fr}
+        yield from _release()
+        for ev in _flush_native():
+            yield ev
+        if last_usage is not None:
+            yield {"usage": last_usage}
         if not saw_finish:
             raise UpstreamError("upstream stream ended before finish_reason", 502)
     except (OSError, http.client.HTTPException) as exc:
@@ -2337,7 +2967,7 @@ def extract_completion_text(data: Dict[str, Any]) -> Tuple[str, str, Dict[str, A
     content = msg.get("content")
     if isinstance(content, list):
         content = "".join(
-            p.get("text", "") for p in content if isinstance(p, dict)
+            p["text"] for p in content if isinstance(p, dict) and isinstance(p.get("text"), str)
         )
     if not isinstance(content, str):
         content = ""
@@ -2481,7 +3111,7 @@ def anthropic_to_canon(body: Dict[str, Any], cfg: Config) -> CanonRequest:
         elif ttype == "tool":
             choice = safe_str(tc.get("name")) or "required"
     elif isinstance(tc, str):
-        choice = tc
+        choice = {"any": "required", "required": "required", "none": "none"}.get(tc, "auto")
 
     stops = body.get("stop_sequences")
     if not isinstance(stops, list):
@@ -2538,7 +3168,13 @@ def openai_to_canon(body: Dict[str, Any], cfg: Config) -> CanonRequest:
             continue
 
         calls: List[ToolCall] = []
-        for nc in raw.get("tool_calls") or []:
+        native_calls = list(raw.get("tool_calls") or [])
+        if isinstance(raw.get("function_call"), dict):
+            # Legacy OpenAI function calling; id = name so role:"function" results pair up.
+            native_calls.append(
+                {"id": safe_str(raw["function_call"].get("name")), "function": raw["function_call"]}
+            )
+        for nc in native_calls:
             if not isinstance(nc, dict):
                 continue
             fn = nc.get("function") if isinstance(nc.get("function"), dict) else {}
@@ -2583,6 +3219,9 @@ def openai_to_canon(body: Dict[str, Any], cfg: Config) -> CanonRequest:
 
     choice = "auto"
     tc = body.get("tool_choice")
+    if tc is None and "function_call" in body:
+        fc = body["function_call"]
+        tc = {"type": "function", "function": fc} if isinstance(fc, dict) else fc
     if isinstance(tc, str):
         choice = tc if tc in ("auto", "none", "required") else "auto"
     elif isinstance(tc, dict):
@@ -2727,9 +3366,11 @@ def build_upstream_payload(
         except (TypeError, ValueError):
             pass
 
-    stops: List[str] = list(req.stop)
+    stops: List[str] = []
     if allow_tools and req.tools and req.tool_choice != "none" and cfg.use_stop and not cfg.parallel:
+        # Ours goes first so the [:4] cap below can never drop it.
         stops.append(CALL_CLOSE)
+    stops.extend(req.stop)
     # Upstreams cap stop sequences; keep it small and unique.
     deduped: List[str] = []
     for s in stops:
@@ -2795,7 +3436,22 @@ def _call_issues(tc: ToolCall, req: CanonRequest, tools: Dict[str, ToolDef]) -> 
                 % (tc.name, ", ".join(sorted(tools)) or "(none)", hint)]
     if req.tool_choice not in ("auto", "required", "none", tc.name):
         return ["Tool `%s` is not the requested tool `%s`." % (tc.name, req.tool_choice)]
-    return ["Call to `%s` is invalid: %s." % (tc.name, issue) for issue in validate_args(tc.args, tools[tc.name].schema)]
+    issues = validate_args(tc.args, tools[tc.name].schema)
+    if _has_non_finite(tc.args) and not any("finite" in i for i in issues):
+        issues.append("arguments must not contain NaN or Infinity (not valid JSON)")
+    return ["Call to `%s` is invalid: %s." % (tc.name, issue) for issue in issues]
+
+
+def _has_non_finite(value: Any, depth: int = 0) -> bool:
+    if depth > 200:
+        return False
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, dict):
+        return any(_has_non_finite(v, depth + 1) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_non_finite(v, depth + 1) for v in value)
+    return False
 
 
 # A rejected call used to be reported to the user as the assistant's answer, which
@@ -2809,6 +3465,25 @@ RETRY_INSTRUCTION = (
     "text. Do not repeat your previous explanation. "
 )
 _MISSING_TOOL = "does not exist"
+
+# A call stopped by loop protection is not malformed, so "reply with only the
+# corrected tool call" (and a worked example of the very tool that was blocked)
+# would push the model straight back into the loop.
+LOOP_INSTRUCTION = (
+    "CRITICAL: Your previous tool call was blocked by loop protection and was NOT executed. "
+    "Do not repeat it; call a different tool, use different arguments, or give your "
+    "final answer in prose. "
+)
+_LOOP_MARKERS = ("You have already called `", "Blocked `", "Dropped a duplicate `")
+
+
+def _is_loop_reason(reason: str) -> bool:
+    return reason.startswith(_LOOP_MARKERS)
+
+TOOLS_DISABLED_REASON = (
+    "Tool calls are disabled for this turn, so your tool call was NOT executed. "
+    "Answer the user directly in prose, without any tool-call markup."
+)
 
 
 # An attempt that produces neither text nor a usable call is worse than a rejected
@@ -2857,6 +3532,8 @@ def _corrective_note(reasons: List[str], req: CanonRequest) -> str:
     corrective prompt has to restate the names it may actually use. Without this,
     three attempts are simply three identical rejections.
     """
+    if reasons and all(_is_loop_reason(r) for r in reasons):
+        return LOOP_INSTRUCTION + " ".join(reasons)
     note = RETRY_INSTRUCTION + " ".join(reasons)
     examples = [render_tool_example(t) for t in _named_tools(reasons, req)[:3]]
     if examples:
@@ -2884,6 +3561,7 @@ def run_turn(req: CanonRequest, cfg: Config) -> TurnResult:
     total_usage: Dict[str, Any] = {}
     max_attempts = 3 if cfg.loop_retry else 1
     wanted_call = False
+    seen_problems: List[str] = []
 
     for attempt in range(1, max_attempts + 1):
         payload = build_upstream_payload(req, cfg, extra, allow_tools)
@@ -2898,6 +3576,7 @@ def run_turn(req: CanonRequest, cfg: Config) -> TurnResult:
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 total_usage[key] = total_usage.get(key, 0) + value
         notes: List[str] = []
+        disabled_calls = bool(not allow_tools and calls)
         if not allow_tools and calls:
             notes.append("Tool calls are disabled for this turn (choice or conversation budget); ignored %d call(s)." % len(calls))
             calls = []
@@ -2917,6 +3596,8 @@ def run_turn(req: CanonRequest, cfg: Config) -> TurnResult:
         requires_call = allow_tools and req.tool_choice not in ("auto", "none")
         wanted_call = wanted_call or bool(problems)
         retry_reasons = list(problems)
+        if disabled_calls and not text.strip():
+            retry_reasons.append(TOOLS_DISABLED_REASON)
         if blocked and not kept:
             retry_reasons.extend(blocked)
         if requires_call and not kept:
@@ -2925,6 +3606,9 @@ def run_turn(req: CanonRequest, cfg: Config) -> TurnResult:
             retry_reasons.append(NO_CALL_REASON)
         if not kept and not retry_reasons and looks_like_botched_call(text):
             retry_reasons.append(BOTCHED_CALL_REASON)
+        for reason in retry_reasons:
+            if reason not in seen_problems:
+                seen_problems.append(reason)
         if retry_reasons and attempt < max_attempts:
             log_warn("retrying rejected tool output: %s" % retry_reasons[0][:160])
             extra = list(extra) + [_corrective_note(retry_reasons, req)]
@@ -2944,7 +3628,7 @@ def run_turn(req: CanonRequest, cfg: Config) -> TurnResult:
                 # itself asked for prose.
                 raise UpstreamError(
                     ("upstream produced no usable reply after %d attempt(s): " % attempt)
-                    + (" ".join(notes) if notes else "empty completion"),
+                    + (" ".join(notes or seen_problems) or "empty completion"),
                     529,
                 )
             text = "I stopped without executing the rejected tool call. " + " ".join(notes)
@@ -2978,6 +3662,7 @@ def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]
     loop_stopped = False
     payload: Dict[str, Any] = {}
 
+    resend_skip = ""
     for attempt in range(1, max_attempts + 1):
         last_attempt = attempt >= max_attempts
         payload = build_upstream_payload(req, cfg, extra + corrective, allow_tools)
@@ -2986,11 +3671,29 @@ def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]
         attempt_raw = 0
         attempt_usage = False
         attempt_text = ""
+        skip = resend_skip
+
+        def _dedupe(piece: str) -> str:
+            # A retry usually restates the preamble the client has already seen.
+            nonlocal skip
+            if not skip:
+                return piece
+            n, m = 0, min(len(piece), len(skip))
+            while n < m and piece[n] == skip[n]:
+                n += 1
+            if n == len(piece):
+                skip = skip[n:]
+                return ""
+            skip = ""
+            return piece[n:]
 
         def consider(tc: ToolCall) -> Iterator[Tuple[str, Any]]:
             nonlocal wanted_call, loop_stopped
             fp = tc.fp()
             if not allow_tools:
+                if not last_attempt:
+                    rejected.append(TOOLS_DISABLED_REASON)
+                    return
                 yield (
                     "text",
                     "\n\n[tool guard] Tool calls are disabled for this turn (choice or conversation budget).",
@@ -2999,7 +3702,8 @@ def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]
             issues = _call_issues(tc, req, tools_by_name)
             if issues:
                 wanted_call = True
-                if req.tool_choice not in ("auto", "none", "required") and tc.name != req.tool_choice:
+                if (last_attempt and req.tool_choice not in ("auto", "none", "required")
+                        and tc.name != req.tool_choice):
                     raise UpstreamError("model did not call the requested tool `%s`" % req.tool_choice, 502)
                 if last_attempt:
                     # Out of attempts. Say nothing: explaining the rejection here
@@ -3068,8 +3772,12 @@ def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]
                     break  # stop paying for output that cannot be used
                 for out in held:
                     if out[0] == "text":
-                        any_text = True
                         attempt_text += out[1]
+                        piece = _dedupe(out[1])
+                        if not piece:
+                            continue
+                        any_text = any_text or bool(piece.strip())
+                        out = ("text", piece)
                     yield out
                 held = []
 
@@ -3090,6 +3798,7 @@ def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]
                 log_debug("RAW attempt %d: %s"
                           % (attempt, truncate_middle("".join(seen_raw), 4000)))
 
+        held_text = "".join(v for k, v in held if k == "text")
         requires_call = allow_tools and req.tool_choice not in ("auto", "none")
         if not rejected and requires_call and not emitted_calls and not last_attempt:
             rejected.append(
@@ -3099,27 +3808,31 @@ def run_turn_stream(req: CanonRequest, cfg: Config) -> Iterator[Tuple[str, Any]]
         if not rejected and not emitted_calls and not last_attempt:
             if wanted_call:
                 rejected.append(NO_CALL_REASON)
-            elif not any_text:
+            elif not any_text and not held_text.strip():
                 rejected.append(EMPTY_REPLY_REASON)
-            elif looks_like_botched_call(attempt_text):
+            elif looks_like_botched_call(attempt_text + held_text):
                 rejected.append(BOTCHED_CALL_REASON)
+        if not attempt_usage and (rejected or emitted_calls or held or attempt_raw):
+            usage_total["prompt_tokens"] = usage_total.get("prompt_tokens", 0) + _estimate_input_tokens(payload)
+            usage_total["completion_tokens"] = usage_total.get("completion_tokens", 0) + estimate_tokens("x" * attempt_raw)
+            usage_reported = True
         if rejected and not emitted_calls:
             # Abandoning the stream early saves output tokens, but the tokens already
             # produced were still billed, so estimate them instead of losing them.
-            if not attempt_usage:
-                usage_total["prompt_tokens"] = (
-                    usage_total.get("prompt_tokens", 0) + _estimate_input_tokens(payload))
-                usage_total["completion_tokens"] = (
-                    usage_total.get("completion_tokens", 0) + estimate_tokens("x" * attempt_raw))
-                usage_reported = True
             log_warn("retrying rejected streamed tool output: %s" % rejected[0][:160])
             corrective = [_corrective_note(rejected, req)]
+            # The client already saw this attempt's text; don't stream it twice.
+            resend_skip = attempt_text
             held = []
             continue
         for out in held:
             if out[0] == "text":
-                any_text = True
                 attempt_text += out[1]
+                piece = _dedupe(out[1])
+                if not piece:
+                    continue
+                any_text = any_text or bool(piece.strip())
+                out = ("text", piece)
             yield out
         held = []
         break
@@ -3190,7 +3903,7 @@ def anthropic_response(req: CanonRequest, res: TurnResult) -> Dict[str, Any]:
 
 
 def sse(event: str, data: Dict[str, Any]) -> bytes:
-    return ("event: %s\ndata: %s\n\n" % (event, json.dumps(data, ensure_ascii=False))).encode("utf-8")
+    return utf8("event: %s\ndata: %s\n\n" % (event, json.dumps(data, ensure_ascii=False)))
 
 
 def anthropic_stream_bytes(req: CanonRequest, cfg: Config) -> Iterator[bytes]:
@@ -3223,6 +3936,7 @@ def anthropic_stream_bytes(req: CanonRequest, cfg: Config) -> Iterator[bytes]:
 
     index = 0
     text_open = False
+    pending_ws = ""
     usage: Dict[str, Any] = {}
     finish = "stop"
     out_chars = 0
@@ -3237,6 +3951,12 @@ def anthropic_stream_bytes(req: CanonRequest, cfg: Config) -> Iterator[bytes]:
         for kind, value in replay():
             if kind == "text":
                 if not text_open:
+                    # Never open a block just for the "\n" between parallel calls.
+                    value = pending_ws + value
+                    pending_ws = ""
+                    if not value.strip():
+                        pending_ws = value
+                        continue
                     yield sse(
                         "content_block_start",
                         {
@@ -3256,6 +3976,7 @@ def anthropic_stream_bytes(req: CanonRequest, cfg: Config) -> Iterator[bytes]:
                     },
                 )
             elif kind == "call":
+                pending_ws = ""
                 if text_open:
                     yield sse("content_block_stop", {"type": "content_block_stop", "index": index})
                     text_open = False
@@ -3370,7 +4091,7 @@ def openai_stream_bytes(req: CanonRequest, cfg: Config, include_usage: bool) -> 
             "model": model,
             "choices": [{"index": 0, "delta": delta, "logprobs": None, "finish_reason": finish}],
         }
-        return ("data: %s\n\n" % json.dumps(obj, ensure_ascii=False)).encode("utf-8")
+        return utf8("data: %s\n\n" % json.dumps(obj, ensure_ascii=False))
 
     turn = run_turn_stream(req, cfg)
     try:
@@ -3430,7 +4151,7 @@ def openai_stream_bytes(req: CanonRequest, cfg: Config, include_usage: bool) -> 
     except UpstreamError as exc:
         log_error("stream failed: %s" % exc.message)
         error = {"error": {"message": exc.message, "type": "api_error", "code": exc.status}}
-        yield ("data: %s\n\n" % json.dumps(error)).encode("utf-8")
+        yield utf8("data: %s\n\n" % json.dumps(error))
         return
 
     yield chunk({}, finish)
@@ -3448,7 +4169,7 @@ def openai_stream_bytes(req: CanonRequest, cfg: Config, include_usage: bool) -> 
             "choices": [],
             "usage": u,
         }
-        yield ("data: %s\n\n" % json.dumps(obj, ensure_ascii=False)).encode("utf-8")
+        yield utf8("data: %s\n\n" % json.dumps(obj, ensure_ascii=False))
 
     yield b"data: [DONE]\n\n"
 
@@ -3473,7 +4194,14 @@ class RequestError(ValueError):
 
 
 def validate_request(body: Dict[str, Any], protocol: str) -> None:
-    """Reject malformed client values before conversion or starting a 200 stream."""
+    """Reject malformed client values before conversion or starting a 200 stream.
+
+    OpenAI clients (and the OpenAI API itself) treat an explicit top-level null as
+    "not set", so those keys are dropped in place; Anthropic stays strict.
+    """
+    if protocol == "openai":
+        for key in [k for k, v in body.items() if v is None and k != "messages"]:
+            del body[key]
     for name in ("max_tokens", "max_completion_tokens"):
         if name in body and (isinstance(body[name], bool) or not isinstance(body[name], int) or body[name] <= 0):
             raise RequestError(name + " must be a positive integer")
@@ -3561,28 +4289,72 @@ class Handler(BaseHTTPRequestHandler):
     def setup(self) -> None:
         super().setup()
         self.connection.settimeout(self.cfg.client_timeout)
+        set_thread_log_level(self.cfg.log_level)  # a server with its own Config logs at its level
+
+    def finish(self) -> None:
+        try:
+            super().finish()
+        finally:
+            set_thread_log_level(None)
 
     # ---------- low-level helpers ----------
 
     def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
         log_debug("%s %s" % (self.address_string(), fmt % args))
 
+    def _origin_allowed(self, origin: str) -> bool:
+        if not origin:
+            return True  # not a browser request
+        allowed = [o.strip() for o in (self.cfg.cors_origins or "").split(",") if o.strip()]
+        if "*" in allowed or origin in allowed:
+            return True
+        try:
+            host = urllib.parse.urlsplit(origin).hostname or ""
+        except ValueError:
+            return False
+        return host in _LOOPBACK_NAMES
+
+    def _guard(self, protocol: str) -> bool:
+        """Refuse cross-site browser requests and DNS-rebound Host headers."""
+        if (self.cfg.host or "").strip("[]") in _LOOPBACK_NAMES:
+            host = (self.headers.get("host") or "").strip()
+            if host.startswith("["):
+                host = host[1:].split("]", 1)[0]
+            else:
+                host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+            if host and host.lower() not in _LOOPBACK_NAMES:
+                self.close_connection = True
+                self._error(protocol, 403, "forbidden host header", "permission_error")
+                return False
+        if not self._origin_allowed(self.headers.get("origin") or ""):
+            self.close_connection = True
+            self._error(protocol, 403, "origin not allowed (set EMU_CORS_ORIGINS)", "permission_error")
+            return False
+        return True
+
     def _cors(self) -> None:
-        self.send_header("access-control-allow-origin", "*")
-        self.send_header("access-control-allow-headers", "*")
-        self.send_header("access-control-allow-methods", "GET,POST,OPTIONS")
+        origin = self.headers.get("origin") or ""
+        if origin and self._origin_allowed(origin):
+            self.send_header("access-control-allow-origin", origin)
+            self.send_header("vary", "origin")
+            self.send_header("access-control-allow-headers", "*")
+            self.send_header("access-control-allow-methods", "GET,POST,OPTIONS")
 
     def _send_json(self, status: int, obj: Dict[str, Any]) -> None:
-        raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        raw = utf8(json.dumps(obj, ensure_ascii=False))
         try:
             self.send_response(status)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(raw)))
+            if self.close_connection:
+                self.send_header("connection", "close")
             self._cors()
             self.end_headers()
-            self.wfile.write(raw)
+            if self.command != "HEAD":
+                self.wfile.write(raw)
             self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+        except OSError:
+            self.close_connection = True
             log_debug("client disconnected before response")
 
     def _start_stream(self) -> bool:
@@ -3590,34 +4362,47 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("content-type", "text/event-stream; charset=utf-8")
             self.send_header("cache-control", "no-cache, no-store")
-            self.send_header("connection", "keep-alive")
             self.send_header("x-accel-buffering", "no")
-            self.send_header("transfer-encoding", "chunked")
+            # HTTP/1.0 peers (e.g. nginx's default proxy_http_version) cannot take chunked.
+            self._chunked = self.request_version != "HTTP/1.0"
+            if self._chunked:
+                self.send_header("connection", "keep-alive")
+                self.send_header("transfer-encoding", "chunked")
+            else:
+                self.close_connection = True
+                self.send_header("connection", "close")
             self._cors()
             self.end_headers()
             return True
-        except (BrokenPipeError, ConnectionResetError):
+        except OSError:
+            self.close_connection = True
             return False
 
     def _write_chunk(self, data: bytes) -> bool:
         if not data:
             return True
         try:
-            self.wfile.write(("%x\r\n" % len(data)).encode("ascii"))
-            self.wfile.write(data)
-            self.wfile.write(b"\r\n")
+            if getattr(self, "_chunked", True):
+                self.wfile.write(("%x\r\n" % len(data)).encode("ascii"))
+                self.wfile.write(data)
+                self.wfile.write(b"\r\n")
+            else:
+                self.wfile.write(data)
             self.wfile.flush()
             return True
-        except (BrokenPipeError, ConnectionResetError):
-            log_info("client disconnected mid-stream")
+        except OSError:  # broken pipe, reset, or a stalled client timing out
+            self.close_connection = True
+            log_info("client disconnected or stalled mid-stream")
             return False
 
     def _end_chunks(self) -> None:
+        if not getattr(self, "_chunked", True):
+            return
         try:
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        except OSError:
+            self.close_connection = True
 
     def _read_body(self) -> Dict[str, Any]:
         lengths = self.headers.get_all("content-length", [])
@@ -3659,7 +4444,7 @@ class Handler(BaseHTTPRequestHandler):
                 chunks.append(chunk)
             raw = b"".join(chunks)
         else:
-            value = lengths[0] if lengths else "0"
+            value = (lengths[0] if lengths else "0").strip(" \t")
             if not re.fullmatch(r"[0-9]+", value):
                 raise RequestError("invalid content-length")
             length = int(value)
@@ -3672,7 +4457,7 @@ class Handler(BaseHTTPRequestHandler):
             def reject_constant(value: str) -> None:
                 raise ValueError("non-finite JSON number")
             data = json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
-        except (ValueError, UnicodeError) as exc:
+        except (ValueError, UnicodeError, RecursionError) as exc:
             raise RequestError("invalid JSON body") from exc
         if not isinstance(data, dict):
             raise RequestError("request body must be a JSON object")
@@ -3690,7 +4475,34 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- routes ----------
 
+    def _upstream_error(self, protocol: str, exc: "UpstreamError") -> None:
+        status = exc.status if exc.status >= 400 else 502
+        if status in (401, 403):
+            status = 502  # the proxy's upstream credential failed, not the client's key
+        detail = exc.message
+        try:
+            err = json.loads(exc.body).get("error")
+            msg = err.get("message") if isinstance(err, dict) else err
+            if isinstance(msg, str) and msg:
+                detail += ": " + msg
+        except Exception:  # noqa: BLE001
+            pass
+        self._error(protocol, status, detail, _ERROR_TYPES.get(status, "api_error"))
+
+    def _method_not_allowed(self) -> None:
+        path = self.path.split("?", 1)[0]
+        protocol = "anthropic" if path.startswith(("/v1/messages", "/messages")) else "openai"
+        self.close_connection = True
+        self._error(protocol, 405, "method %s not allowed" % self.command)
+
+    do_PUT = do_DELETE = do_PATCH = _method_not_allowed  # noqa: N815
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        self.do_GET()
+
     def do_OPTIONS(self) -> None:  # noqa: N802
+        if not self._guard("openai"):
+            return
         self.send_response(204)
         self._cors()
         self.send_header("content-length", "0")
@@ -3698,6 +4510,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        protocol = "anthropic" if path.startswith(("/v1/messages", "/messages")) else "openai"
+        if not self._guard(protocol):
+            return
         if path in ("/v1/models", "/models"):
             self._send_json(
                 200,
@@ -3747,11 +4562,17 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
             return
-        self._error("openai", 404, "unknown route %s" % path, "not_found_error")
+        self._error(protocol, 404, "unknown route %s" % path, "not_found_error")
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         protocol = "anthropic" if path.startswith(("/v1/messages", "/messages")) else "openai"
+        if not self._guard(protocol):
+            return
+        if path not in _POST_ROUTES:
+            self.close_connection = True  # body left unread
+            self._error(protocol, 404, "unknown route %s" % path, "not_found_error")
+            return
         try:
             body = self._read_body()
             if self.cfg.log_bodies:
@@ -3771,7 +4592,7 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             self._error(protocol, 408, "request body timed out")
         except UpstreamError as exc:
-            self._error(protocol, 502 if exc.status < 400 else exc.status, exc.message, "api_error")
+            self._upstream_error(protocol, exc)
         except (BrokenPipeError, ConnectionResetError):
             log_info("client disconnected")
         except Exception as exc:  # noqa: BLE001 - never kill the server
@@ -3794,16 +4615,38 @@ class Handler(BaseHTTPRequestHandler):
             first = None
         except UpstreamError as exc:
             log_error("stream refused: %s" % exc.message)
-            self._error(protocol, exc.status or 502, exc.message, "api_error")
+            self._upstream_error(protocol, exc)
             return
-        if not self._start_stream():
-            return
-        if first is not None and not self._write_chunk(first):
-            return
-        for piece in source:
-            if not self._write_chunk(piece):
+        try:
+            self._started_stream = False
+            if not self._start_stream():
                 return
-        self._end_chunks()
+            self._started_stream = True
+            if first is not None and not self._write_chunk(first):
+                return
+            for piece in source:
+                if not self._write_chunk(piece):
+                    return
+            self._end_chunks()
+        except Exception as exc:  # noqa: BLE001 - headers are out; never write a 2nd response
+            log_error("stream aborted after headers: %r" % (exc,))
+            self.close_connection = True
+            if getattr(self, "_started_stream", False):
+                msg = "internal error while streaming: %s" % type(exc).__name__
+                if protocol == "anthropic":
+                    event = sse("error", {"type": "error", "error": {"type": "api_error", "message": msg}})
+                else:
+                    event = utf8("data: %s\n\n" % json.dumps(
+                        {"error": {"message": msg, "type": "api_error", "code": 500}}))
+                if self._write_chunk(event):
+                    self._end_chunks()
+        finally:
+            close = getattr(source, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _handle_count_tokens(self, body: Dict[str, Any]) -> None:
         validate_request(body, "anthropic")
@@ -3861,9 +4704,23 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, openai_response(req, res))
 
 
+_LOOPBACK_NAMES = ("127.0.0.1", "localhost", "::1")
+_POST_ROUTES = (
+    "/v1/messages/count_tokens", "/messages/count_tokens",
+    "/v1/messages", "/messages",
+    "/v1/chat/completions", "/chat/completions",
+)
+_ERROR_TYPES = {
+    400: "invalid_request_error", 401: "authentication_error", 403: "permission_error",
+    404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error",
+    529: "overloaded_error",
+}
+
+
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 128  # the default of 5 resets bursts of parallel requests
 
     def __init__(self, server_address, RequestHandlerClass=Handler, bind_and_activate=True, cfg=None):
         self.cfg = cfg if cfg is not None else CFG
@@ -3874,7 +4731,7 @@ def serve(cfg: Config) -> None:
     if not cfg.upstream_key:
         log_warn("EMU_UPSTREAM_API_KEY is not set - upstream calls will likely fail with 401")
     httpd = Server((cfg.host, cfg.port), Handler, cfg=cfg)
-    log_info("emutools %s listening on http://%s:%d" % (__version__, cfg.host, cfg.port))
+    log_info("emutools %s listening on http://%s:%d" % (__version__, cfg.host, httpd.server_address[1]))
     log_info("upstream %s  big=%s  small=%s" % (_upstream_url(cfg), cfg.model_big, cfg.model_small))
     log_info("Claude Code : ANTHROPIC_BASE_URL=http://%s:%d ANTHROPIC_AUTH_TOKEN=dummy claude" % (cfg.host, cfg.port))
     log_info("OpenAI apps : OPENAI_BASE_URL=http://%s:%d/v1 OPENAI_API_KEY=dummy" % (cfg.host, cfg.port))
@@ -3908,7 +4765,7 @@ class _MockUpstream:
             self.responses = list(responses)
             self.requests = []
 
-    def _next(self) -> Any:
+    def _next(self, body: Optional[Dict[str, Any]] = None) -> Any:
         with self._lock:
             if self.responses:
                 return self.responses.pop(0)
@@ -3943,7 +4800,7 @@ class _MockUpstream:
                     body = {}
                 with outer._lock:
                     outer.requests.append(body)
-                spec = outer._next()
+                spec = outer._next(body)
 
                 if isinstance(spec, dict) and "status" in spec:
                     payload = json.dumps(spec.get("body", {"error": "boom"})).encode()
@@ -4025,7 +4882,10 @@ class _MockUpstream:
                 self.end_headers()
                 self.wfile.write(payload)
 
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        class _Server(ThreadingHTTPServer):
+            request_queue_size = 128  # the 16-way concurrency check overflows 5
+
+        self.httpd = _Server(("127.0.0.1", 0), H)
         self.httpd.daemon_threads = True
         self.port = self.httpd.server_address[1]
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
@@ -4540,6 +5400,7 @@ def _selftest_part3(r: "_Runner", mock: "_MockUpstream", pport: int, saved: Conf
         data = json.loads(body)
         tu = [b for b in (data.get("content") or []) if b.get("type") == "tool_use"]
         r.eq("unknown tool not forwarded", len(tu), 0)
+        r.eq("unknown tool -> retryable 529", status, 529)
 
         # invalid args trigger a repair round trip
         mock.script(
@@ -4780,7 +5641,9 @@ def _selftest_part3(r: "_Runner", mock: "_MockUpstream", pport: int, saved: Conf
         for t in threads:
             t.join(timeout=60)
         r.eq("16 concurrent requests, no exceptions", errors, [])
+        r.eq("16 concurrent responses", len(results), 16)
         r.eq("all concurrent requests 200", sorted(set(results)), [200])
+        r.check("no hung request threads", not any(t.is_alive() for t in threads))
 
         # --- regressions built from bytes a real upstream actually returned
         r.section("14. Real captured output (deepseek-flash, live API)")
@@ -5118,7 +5981,8 @@ def _selftest_part2(r: "_Runner") -> int:  # noqa: C901
     r.eq("two streamed calls", len(calls), 2)
 
     _t, calls = stream_split("<tool_result>fake result</tool_result>Answer is 7.", [5])
-    r.eq("streamed fabricated result dropped", len(calls), 0)
+    r.check("streamed fabricated result dropped",
+            not calls and "fake result" not in _t and "Answer is 7." not in _t, repr((_t, calls)))
     text, _c = stream_split("<tool_result>fake</tool_result>Answer is 7.", [5])
     r.check("streamed fabricated text removed", "fake" not in text, repr(text))
 
@@ -5370,7 +6234,21 @@ def _selftest_part2(r: "_Runner") -> int:  # noqa: C901
         raise
 
 
-def run_selftest() -> int:  # noqa: C901 - a test suite is allowed to be long
+_ENV_PREFIXES = ("EMU_", "DEEPSEEK_")
+
+
+def run_selftest() -> int:
+    """Run the checks with a clean environment so the user's EMU_* settings cannot skew them."""
+    saved = {k: v for k, v in os.environ.items() if k.startswith(_ENV_PREFIXES)}
+    for k in saved:
+        del os.environ[k]
+    try:
+        return _run_selftest_checks()
+    finally:
+        os.environ.update(saved)
+
+
+def _run_selftest_checks() -> int:  # noqa: C901 - a test suite is allowed to be long
     random.seed(1337)
     r = _Runner()
 
@@ -5582,13 +6460,23 @@ def run_selftest() -> int:  # noqa: C901 - a test suite is allowed to be long
 # ======================================================================================
 
 
+def _port(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("invalid port %r" % value)
+    if not 0 <= n <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 0 and 65535")
+    return n
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="emutools",
         description="Emulated tool-calling proxy for Claude Code and OpenAI-compatible clients.",
     )
     parser.add_argument("--host", default=None, help="bind host (default 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=None, help="bind port (default 8787)")
+    parser.add_argument("--port", type=_port, default=None, help="bind port (default 8787)")
     parser.add_argument("--upstream", default=None, help="upstream base URL")
     parser.add_argument("--api-key", default=None, help="upstream API key")
     parser.add_argument("--model-big", default=None, help="model for the main tier")
@@ -5606,17 +6494,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         CFG.log_level = args.log or "error"
         return run_selftest()
 
-    if args.host:
+    if args.host is not None:
         CFG.host = args.host
-    if args.port:
+    if args.port is not None:
         CFG.port = args.port
-    if args.upstream:
+    if args.upstream is not None:
         CFG.upstream_base = args.upstream.rstrip("/")
-    if args.api_key:
+    if args.api_key is not None:
         CFG.upstream_key = args.api_key
-    if args.model_big:
+    if args.model_big is not None:
         CFG.model_big = args.model_big
-    if args.model_small:
+    if args.model_small is not None:
         CFG.model_small = args.model_small
     if args.max_tool_rounds is not None:
         CFG.max_tool_rounds = args.max_tool_rounds

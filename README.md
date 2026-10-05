@@ -161,7 +161,7 @@ With `EMU_PARALLEL=false`, at most one call is forwarded. With it enabled, the c
 per-turn cap applies; a client's `parallel_tool_calls=false` or Anthropic
 `disable_parallel_tool_use=true` can still disable parallel calls.
 
-Rejected calls are retried up to three times with corrective instructions when
+A rejected call gets up to two corrective retries (three attempts in total) when
 `EMU_LOOP_RETRY=true`, on the streaming path as well as the non-streaming one, inside the
 same client turn. The corrective prompt restates the available tool names, suggests the
 closest match and shows a correct call for the tool that failed.
@@ -196,12 +196,13 @@ implemented. Client permissions remain the authority for executing tools.
 | `EMU_MAX_CALLS_PER_TURN` | `4` | Cap when parallel calling is enabled |
 | `EMU_PARALLEL` | `false` | Otherwise enforce one call per turn |
 | `EMU_USE_STOP` | `false` | Opt-in closing-tag stop; can truncate literal code |
-| `EMU_LOOP_RETRY` | `true` | Bounded non-streaming corrective retries |
+| `EMU_LOOP_RETRY` | `true` | Up to 2 corrective retries (3 attempts), streaming and non-streaming |
 | `EMU_SALVAGE` | `true` | Recover bare JSON calls |
 | `EMU_MAX_RESULT_CHARS` | `24000` | Middle-truncate long tool results |
 | `EMU_MAX_REQUEST_BYTES` | `16777216` | 16 MiB limit for length and chunked bodies |
 | `EMU_CLIENT_TIMEOUT` | `30` | Client socket timeout in seconds |
 | `EMU_TIMEOUT` / `EMU_MAX_RETRIES` | `300` / `3` | Upstream timeout and connection attempts |
+| `EMU_CORS_ORIGINS` | *(empty)* | Extra browser origins allowed to call the proxy (comma-separated, `*` for any); loopback origins are always allowed, other cross-site browser requests get 403 |
 | `EMU_LOG` / `EMU_LOG_BODIES` | `info` / `false` | Logging; bodies also dump each raw model reply, so they can contain sensitive prompts |
 
 ```bash
@@ -213,7 +214,8 @@ EMU_MODEL_MAP='my-model=deepseek-v4-pro,tiny=deepseek-flash' \
 
 `emutools.py` at the repository root **is** the single-file build, committed and kept
 current automatically: CI rebuilds it on every push to the default branch, verifies it with
-its own self-test, and commits it back when it differs. Nobody has to run the builder.
+its own self-test, and commits it back when it differs. Pull requests and other branches
+must include the rebuilt file (`python3 build_single_file.py`); CI fails them when it is stale.
 
 ```bash
 python3 emutools.py                       # dependency-free deployment, no build step

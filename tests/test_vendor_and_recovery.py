@@ -24,6 +24,23 @@ from emutools.protocol import (
     validate_args,
 )
 
+
+_SAVED_ENV = {}
+
+
+def setUpModule():
+    """Run against defaults: a developer's EMU_* settings must not change results."""
+    import os
+    for key in [k for k in os.environ if k.startswith(("EMU_", "DEEPSEEK_"))]:
+        _SAVED_ENV[key] = os.environ.pop(key)
+
+
+def tearDownModule():
+    import os
+    os.environ.update(_SAVED_ENV)
+    _SAVED_ENV.clear()
+
+
 PIPE = "\uff5c"
 USEP = "\u2581"
 
@@ -344,7 +361,7 @@ class RejectedCallRecoveryTests(unittest.TestCase):
 
     def test_named_tool_choice_still_fails_loudly(self):
         with self.assertRaises(engine.UpstreamError):
-            self.run_stream([self.BAD], tool_choice="Read")
+            self.run_stream([self.BAD] * 3, tool_choice="Read")
 
     def test_sync_path_suggests_the_closest_tool_too(self):
         req = CanonRequest(model="m", messages=[CanonMessage("user", "go")], tools=TOOLS)
@@ -562,6 +579,7 @@ class BareCallAfterProseTests(unittest.TestCase):
                 text, calls = self.stream(raw, width)
                 self.assertEqual([c.name for c in calls], ["Read"])
                 self.assertNotIn("```json", text)
+                self.assertNotIn("```", text)
 
     def test_an_unfinished_bare_call_is_never_leaked_mid_stream(self):
         parser = StreamToolParser(self.TOOLS)

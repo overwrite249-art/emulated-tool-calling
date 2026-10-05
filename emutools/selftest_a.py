@@ -31,7 +31,7 @@ class _MockUpstream:
             self.responses = list(responses)
             self.requests = []
 
-    def _next(self) -> Any:
+    def _next(self, body: Optional[Dict[str, Any]] = None) -> Any:
         with self._lock:
             if self.responses:
                 return self.responses.pop(0)
@@ -66,7 +66,7 @@ class _MockUpstream:
                     body = {}
                 with outer._lock:
                     outer.requests.append(body)
-                spec = outer._next()
+                spec = outer._next(body)
 
                 if isinstance(spec, dict) and "status" in spec:
                     payload = json.dumps(spec.get("body", {"error": "boom"})).encode()
@@ -148,7 +148,10 @@ class _MockUpstream:
                 self.end_headers()
                 self.wfile.write(payload)
 
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        class _Server(ThreadingHTTPServer):
+            request_queue_size = 128  # the 16-way concurrency check overflows 5
+
+        self.httpd = _Server(("127.0.0.1", 0), H)
         self.httpd.daemon_threads = True
         self.port = self.httpd.server_address[1]
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
@@ -663,6 +666,7 @@ def _selftest_part3(r: "_Runner", mock: "_MockUpstream", pport: int, saved: Conf
         data = json.loads(body)
         tu = [b for b in (data.get("content") or []) if b.get("type") == "tool_use"]
         r.eq("unknown tool not forwarded", len(tu), 0)
+        r.eq("unknown tool -> retryable 529", status, 529)
 
         # invalid args trigger a repair round trip
         mock.script(
@@ -903,7 +907,9 @@ def _selftest_part3(r: "_Runner", mock: "_MockUpstream", pport: int, saved: Conf
         for t in threads:
             t.join(timeout=60)
         r.eq("16 concurrent requests, no exceptions", errors, [])
+        r.eq("16 concurrent responses", len(results), 16)
         r.eq("all concurrent requests 200", sorted(set(results)), [200])
+        r.check("no hung request threads", not any(t.is_alive() for t in threads))
 
         # --- regressions built from bytes a real upstream actually returned
         r.section("14. Real captured output (deepseek-flash, live API)")

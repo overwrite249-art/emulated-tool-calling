@@ -16,13 +16,23 @@ from .selftest_b import *  # noqa: F401,F403
 # ======================================================================================
 
 
+def _port(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("invalid port %r" % value)
+    if not 0 <= n <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 0 and 65535")
+    return n
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="emutools",
         description="Emulated tool-calling proxy for Claude Code and OpenAI-compatible clients.",
     )
     parser.add_argument("--host", default=None, help="bind host (default 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=None, help="bind port (default 8787)")
+    parser.add_argument("--port", type=_port, default=None, help="bind port (default 8787)")
     parser.add_argument("--upstream", default=None, help="upstream base URL")
     parser.add_argument("--api-key", default=None, help="upstream API key")
     parser.add_argument("--model-big", default=None, help="model for the main tier")
@@ -40,17 +50,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         CFG.log_level = args.log or "error"
         return run_selftest()
 
-    if args.host:
+    if args.host is not None:
         CFG.host = args.host
-    if args.port:
+    if args.port is not None:
         CFG.port = args.port
-    if args.upstream:
+    if args.upstream is not None:
         CFG.upstream_base = args.upstream.rstrip("/")
-    if args.api_key:
+    if args.api_key is not None:
         CFG.upstream_key = args.api_key
-    if args.model_big:
+    if args.model_big is not None:
         CFG.model_big = args.model_big
-    if args.model_small:
+    if args.model_small is not None:
         CFG.model_small = args.model_small
     if args.max_tool_rounds is not None:
         CFG.max_tool_rounds = args.max_tool_rounds

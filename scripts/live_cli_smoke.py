@@ -56,6 +56,35 @@ def stop(proc):
             proc.wait(timeout=5)
 
 
+
+def bash_outputs(records, needle):
+    """Outputs of shell tool calls whose command mentions `needle`.
+
+    A marker string merely appearing in the transcript proves nothing: it is in the
+    prompt and in the fixture source the client may Read. Only count it when it came
+    back from actually running the test.
+    """
+    out = []
+    ids = set()
+    for r in records:
+        msg = r.get("message") if isinstance(r.get("message"), dict) else {}
+        for b in msg.get("content") or []:
+            if (isinstance(b, dict) and b.get("type") == "tool_use"
+                    and str(b.get("name", "")).lower() == "bash"
+                    and needle in json.dumps(b.get("input"), ensure_ascii=False)):
+                ids.add(b.get("id"))
+    for r in records:
+        msg = r.get("message") if isinstance(r.get("message"), dict) else {}
+        for b in msg.get("content") or []:
+            if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id") in ids:
+                out.append(json.dumps(b.get("content"), ensure_ascii=False))
+        part = r.get("part") if isinstance(r.get("part"), dict) else {}
+        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+        if str(part.get("tool", "")).lower() == "bash" and needle in json.dumps(state.get("input"), ensure_ascii=False):
+            out.append(json.dumps(state.get("output"), ensure_ascii=False))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--client", choices=["claude", "opencode"], required=True)
@@ -176,7 +205,8 @@ def main():
             result["client_reported_success"] = any(
                 (r.get("type") == "result" and not r.get("is_error") and "CLI_SMOKE_OK" in r.get("result", "")) or
                 (r.get("type") == "text" and "CLI_SMOKE_OK" in r.get("part", {}).get("text", "")) for r in records)
-            result["client_ran_fixture_test"] = "FIXTURE_TEST_PASS" in transcript
+            result["client_ran_fixture_test"] = any(
+                "FIXTURE_TEST_PASS" in o for o in bash_outputs(records, "test_greeting.py"))
             result["passed"] = (result["exit_code"] == 0 and result["fixture_test_passed"]
                                 and result["mcp_passed"] and result["client_reported_success"] and result["client_ran_fixture_test"])
     finally:

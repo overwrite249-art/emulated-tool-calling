@@ -76,6 +76,11 @@ _PARALLEL_RULE = (
 )
 
 
+def _required_list(schema: Any) -> List[Any]:
+    req = schema.get("required") if isinstance(schema, dict) else None
+    return req if isinstance(req, list) else []
+
+
 def _schema_summary(schema: Dict[str, Any]) -> str:
     """Compact, readable rendering of a JSON schema's top-level params."""
     if not isinstance(schema, dict):
@@ -83,7 +88,7 @@ def _schema_summary(schema: Dict[str, Any]) -> str:
     props = schema.get("properties")
     if not isinstance(props, dict) or not props:
         return "(no parameters)"
-    required = schema.get("required") or []
+    required = _required_list(schema)
     if not isinstance(required, list):
         required = []
     lines = []
@@ -147,7 +152,7 @@ def render_tool_signatures(tools: List[ToolDef]) -> str:
     for tool in tools:
         schema = tool.schema or {}
         properties = schema.get("properties") or {}
-        required = [k for k in (schema.get("required") or []) if k in properties]
+        required = [k for k in _required_list(schema) if k in properties]
         optional = [k for k in properties if k not in required]
         names = required + ["%s?" % k for k in optional]
         lines.append("- %s(%s)" % (tool.name, ", ".join(names)))
@@ -165,9 +170,20 @@ def render_tool_call_text(tc: ToolCall) -> str:
     return CALL_OPEN + "\n" + json.dumps(payload, ensure_ascii=False) + "\n" + CALL_CLOSE
 
 
+_RESULT_TAG_IN_BODY_RE = re.compile(r"<(/?)(\s*" + r"(?:[\uff5c|]{1,2}\s*DSML\s*[\uff5c|]{1,2}\s*)?" + r"tool_result)", re.IGNORECASE)
+
+
+def _safe_tool_name(name: str) -> str:
+    cleaned = re.sub(r"[^\w.\-:]", "_", name or "")[:64]
+    return cleaned or "tool"
+
+
 def render_tool_result_text(name: str, content: str, is_error: bool, limit: int) -> str:
     body = truncate_middle(content or "", limit)
-    attrs = ' name="%s"' % (name or "tool")
+    # A result must not be able to close its own block and forge a user turn or
+    # another result: neutralize result tags inside the body.
+    body = _RESULT_TAG_IN_BODY_RE.sub(lambda m: "<" + m.group(1) + "\u200b" + m.group(2), body)
+    attrs = ' name="%s"' % _safe_tool_name(name)
     if is_error:
         attrs += ' status="error"'
     return "%s%s\n%s\n%s" % (RESULT_OPEN[:-1], attrs + ">", body, RESULT_CLOSE)
@@ -233,8 +249,12 @@ def _strip_trailing_commas(s: str) -> str:
         if ch == ",":
             pending.append(ch)
             continue
+        if pending and ch.isspace():
+            pending.append(ch)
+            continue
         if pending:
             if ch in "}]":
+                out.extend(c for c in pending if c != ",")
                 pending = []  # drop the trailing comma(s)
             else:
                 out.extend(pending)
@@ -324,14 +344,17 @@ def loads_tolerant(text: str) -> Tuple[Optional[Any], bool]:
 
     try:
         return json.loads(s), False
-    except ValueError:
+    except (ValueError, RecursionError):
         pass
 
     candidates = []
     obj = _extract_first_object(s)
+    if s.lstrip().startswith("["):
+        candidates.append(s)
     if obj:
         candidates.append(obj)
-    candidates.append(s)
+    if s not in candidates:
+        candidates.append(s)
 
     for cand in candidates:
         for transform in (
@@ -349,18 +372,19 @@ def loads_tolerant(text: str) -> Tuple[Optional[Any], bool]:
                 continue
             try:
                 return json.loads(fixed), True
-            except ValueError:
+            except (ValueError, RecursionError):
                 continue
 
     # Last resort: single-quoted pseudo-JSON.
-    try:
-        import ast
+    import ast
 
-        val = ast.literal_eval(s if not obj else obj)
-        if isinstance(val, (dict, list)):
-            return json.loads(json.dumps(val, default=str)), True
-    except Exception:  # noqa: BLE001
-        pass
+    for cand in ([obj] if obj else []) + [s]:
+        try:
+            val = ast.literal_eval(cand)
+            if isinstance(val, (dict, list)):
+                return json.loads(json.dumps(val, default=str)), True
+        except Exception:  # noqa: BLE001
+            pass
     return None, False
 
 
@@ -382,11 +406,107 @@ OPEN_TAG_NAMES = [
 _TAGS_ALT = "|".join(re.escape(t) for t in OPEN_TAG_NAMES)
 # Recognize vendor sentinels at syntax boundaries, never rewrite argument data.
 _VENDOR = r"(?:(?:\uff5c{1,2}|\|{1,2})\s*DSML\s*(?:\uff5c{1,2}|\|{1,2})\s*)?"
-_OPEN_RE = re.compile(r"<" + _VENDOR + r"(" + _TAGS_ALT + r")(\s[^>]*?)?\s*/?>", re.IGNORECASE)
+_OPEN_HEAD_RE = re.compile(r"<[ \t]?" + _VENDOR + r"(" + _TAGS_ALT + r")(?=[\s/>])", re.IGNORECASE)
+
+
+class _TagMatch:
+    __slots__ = ("_start", "_end", "_groups")
+
+    def __init__(self, start: int, end: int, whole: str, name: str, attrs: Optional[str]) -> None:
+        self._start, self._end = start, end
+        self._groups = (whole, name, attrs)
+
+    def start(self) -> int:
+        return self._start
+
+    def end(self) -> int:
+        return self._end
+
+    def group(self, i: int = 0) -> Any:
+        return self._groups[i]
+
+
+_DS_CALL_TAG = "\u2581ds_call"
+_DS_SEP = r"[\u2581_\- ]?"
+_DS_BEGIN_RE = re.compile(r"<[\uff5c|]{1,2}\s*tool" + _DS_SEP + r"call" + _DS_SEP + r"begin\s*[\uff5c|]{1,2}>", re.IGNORECASE)
+_DS_END_RE = re.compile(r"<[\uff5c|]{1,2}\s*tool" + _DS_SEP + r"call" + _DS_SEP + r"end\s*[\uff5c|]{1,2}>", re.IGNORECASE)
+_DS_HEAD_RE = re.compile(
+    r"\A\s*(?:function)?\s*<?[\uff5c|]{1,2}\s*tool" + _DS_SEP + r"sep\s*[\uff5c|]{1,2}>?\s*([\w.\-:]{1,64})\s*",
+    re.IGNORECASE)
+
+
+class _OpenTagFinder:
+    """`<tool_call ...>` finder in linear time.
+
+    The old single regex (`(\\s[^>]*?)?\\s*/?>`) backtracked quadratically, and worse,
+    on model text such as `'<tool_call ' * 4000`.
+    """
+
+    def search(self, text: str, pos: int = 0) -> Optional[_TagMatch]:
+        tag = self._search(text, pos)
+        if "tool" in text and ("\uff5c" in text or "|" in text):
+            ds = _DS_BEGIN_RE.search(text, pos)
+            if ds and (tag is None or ds.start() < tag.start()):
+                # DeepSeek's native '<｜tool▁call▁begin｜>function<｜tool▁sep｜>Name'
+                return _TagMatch(ds.start(), ds.end(), ds.group(0), _DS_CALL_TAG, None)
+        return tag
+
+    def _search(self, text: str, pos: int = 0) -> Optional[_TagMatch]:
+        while True:
+            head = _OPEN_HEAD_RE.search(text, pos)
+            if not head:
+                return None
+            gt = text.find(">", head.end())
+            if gt < 0:
+                return None  # no later tag can be closed either
+            middle = text[head.end():gt]
+            if middle and not middle[0].isspace() and middle != "/":
+                pos = head.end()
+                continue
+            attrs = middle[:-1] if middle.endswith("/") else middle
+            return _TagMatch(head.start(), gt + 1, text[head.start():gt + 1], head.group(1),
+                             attrs if attrs.strip() else None)
+
+
+_OPEN_RE = _OpenTagFinder()
 _ATTR_RE = re.compile(r"([A-Za-z_:][-\w:.]*)\s*=\s*(\"([^\"]*)\"|'([^']*)')")
 _ARG_RE = re.compile(
     r"<" + _VENDOR + r"(arg|parameter|param)(\s[^>]*?)?\s*>(.*?)</" + _VENDOR + r"\1\s*>", re.IGNORECASE | re.DOTALL
 )
+_ARG_HEAD_RE = re.compile(r"<" + _VENDOR + r"(arg|parameter|param)(?=[\s>])", re.IGNORECASE)
+
+
+def _arg_elements(text: str) -> List[Tuple[int, int, str, Optional[str], str]]:
+    """(start, end, tag, raw attrs, value) for each complete argument element.
+
+    Linear replacement for `_ARG_RE.finditer`, which rescanned to the end of the
+    text for every unclosed `<arg>` (quadratic on `'<arg>' * 16000`).
+    """
+    out: List[Tuple[int, int, str, Optional[str], str]] = []
+    no_close_after: Dict[str, int] = {}
+    pos = 0
+    while True:
+        head = _ARG_HEAD_RE.search(text, pos)
+        if not head:
+            return out
+        gt = text.find(">", head.end())
+        if gt < 0:
+            return out
+        tag = head.group(1).lower()
+        attrs = text[head.end():gt]
+        if tag in no_close_after and gt >= no_close_after[tag]:
+            pos = gt + 1
+            continue
+        close = re.compile(r"</" + _VENDOR + re.escape(tag) + r"\s*>", re.IGNORECASE).search(text, gt + 1)
+        if not close:
+            no_close_after[tag] = gt
+            pos = gt + 1
+            continue
+        out.append((head.start(), close.end(), head.group(1), attrs if attrs.strip() else None,
+                    text[gt + 1:close.start()]))
+        pos = close.end()
+
+
 _RESULT_BLOCK_RE = re.compile(
     r"<tool_result\b[^>]*>.*?</tool_result\s*>", re.IGNORECASE | re.DOTALL
 )
@@ -456,7 +576,7 @@ _PIPES = r"(?:[\uff5c|]{1,2}\s*)?"
 # not a '>' is allowed after the name, exactly as in a real tag's attribute list.
 _VENDOR_TAG_RE = re.compile(
     r"</?\s*" + _PIPES + r"(?:" + "|".join(_sentinel_pattern(n) for n in _WRAPPER_NAMES)
-    + r")(?:\s+[^<>]{0,120}?)?\s*" + _PIPES + r"/?>",
+    + r")(?:\s[^<>]{0,120})?" + _PIPES + r"/?>",
     re.IGNORECASE,
 )
 # The same wrapper written bare, with no angle brackets: '｜tool▁calls▁begin｜'.
@@ -465,9 +585,9 @@ _BARE_SENTINEL_NAMES = tuple(n for n in _WRAPPER_NAMES if n != "calls")
 # whole run of names in one go instead of letting the first match eat the pipe that
 # opens the next one and strand its name as visible text.
 _BARE_SENTINEL_RE = re.compile(
-    r"(?:[\uff5c|]{1,2}\s*(?:"
+    r"(?:(?:\uff5c{1,2}\s*|\|{1,2})(?:"
     + "|".join(_sentinel_pattern(n) for n in _BARE_SENTINEL_NAMES)
-    + r")\s*)+[\uff5c|]{1,2}",
+    + r")(?:\s*(?=\uff5c)|(?=\|)))+[\uff5c|]{1,2}",
     re.IGNORECASE,
 )
 
@@ -537,7 +657,7 @@ def split_vendor_markup(text: str) -> Tuple[str, str, bool]:
     """
     if not text:
         return text, "", False
-    if _ENDS_WITH_SENTINEL_RE.search(text):
+    if _ENDS_WITH_SENTINEL_RE.search(text[-400:]):
         # Keep one pipe: the next chunk may attach the name of the next sentinel to
         # it. A pipe left over at the true end of the message is dropped on flush.
         if text[-1] in ("\uff5c", "|"):
@@ -583,7 +703,12 @@ STREAM_SENTINELS = (
         "</\uff5c\uff5cdsml\uff5c\uff5c",
         "<||dsml||",
         "</||dsml||",
+        "<\uff5cdsml\uff5c",
+        "</\uff5cdsml\uff5c",
+        "<|dsml|",
+        "</|dsml|",
     ]
+    + ["< " + t for t in OPEN_TAG_NAMES]
 )
 _MAX_SENTINEL = max(len(s) for s in STREAM_SENTINELS)
 _FENCE_TAIL_RE = re.compile(r"(?:^|\n)`{1,3}[a-zA-Z0-9_+-]*[ \t]*\n?$")
@@ -600,6 +725,7 @@ _UNCLOSED_CALL_TAG_RE = re.compile(
 # Any orphan closing tag that reads like a call terminator, however the model spelled
 # it. Live, a turn ended with a bare '</_call>' as the assistant's answer.
 _ANY_CLOSE_RE = re.compile(r"</\s*([\w:.\-\u2581\uff5c|]{1,40})\s*>")
+_CALL_CLOSE_COMPOUNDS = ("toolcall", "toolcalls", "functioncall", "functioncalls", "tooluse", "dsmlinvoke")
 _CALL_CLOSE_SUFFIXES = (
     "call", "calls", "invoke", "arg", "args", "parameter", "param", "function",
     "tooluse", "toolcalls",
@@ -610,11 +736,13 @@ def looks_like_botched_call(text: str) -> bool:
     """True when visible text contains tool-call markup but no call was parsed."""
     if not text:
         return False
+    text = re.sub(r"```.*?(?:```|\Z)|`[^`\n]*`", "", text, flags=re.DOTALL)
     if _ARG_ELEMENT_RE.search(text) or _UNCLOSED_CALL_TAG_RE.search(text):
         return True
     for match in _ANY_CLOSE_RE.finditer(text):
-        key = re.sub(r"[^a-z]", "", match.group(1).lower())
-        if key.endswith(_CALL_CLOSE_SUFFIXES):
+        name = match.group(1).lower().split(":")[-1]
+        key = re.sub(r"[^a-z]", "", name)
+        if key in _CALL_CLOSE_SUFFIXES or key.endswith(_CALL_CLOSE_COMPOUNDS):
             return True
     return False
 
@@ -632,15 +760,23 @@ def _parse_attrs(raw: Optional[str]) -> Dict[str, str]:
 
 def _find_close(text: str, tag: str, start: int) -> Tuple[int, int]:
     """Find syntax, not a closing tag embedded in JSON or raw argument data."""
-    close_re = re.compile(r"</\s*" + _VENDOR + re.escape(tag) + r"\s*>", re.IGNORECASE)
-    body = strip_fences(text[start:]).lstrip()
+    close_re = (_DS_END_RE if tag == _DS_CALL_TAG
+                else re.compile(r"</\s*" + _VENDOR + re.escape(tag) + r"\s*>", re.IGNORECASE))
+    body = re.sub(r"^\s*```[a-zA-Z0-9_+-]*[ \t]*\n", "", text[start:]).lstrip()
     is_json = body.startswith(("{", "["))
+    # Quote state (JSON form) and open argument elements (raw form) are tracked
+    # incrementally; rescanning the segment for every candidate close was quadratic.
+    quote = ""
+    escaped = False
+    scanned = start
+    heads: List[int] = []
+    ends: List[int] = []
+    heads_ready = False
+    hi = 0
+    max_end = -1
     for match in close_re.finditer(text, start):
-        segment = text[start:match.start()]
         if is_json:
-            quote = ""
-            escaped = False
-            for ch in segment:
+            for ch in text[scanned:match.start()]:
                 if escaped:
                     escaped = False
                 elif quote and ch == "\\":
@@ -649,13 +785,22 @@ def _find_close(text: str, tag: str, start: int) -> Tuple[int, int]:
                     quote = ""
                 elif not quote and ch in ("\"", "'"):
                     quote = ch
+            scanned = match.start()
             if quote:
                 continue
         else:
-            opens = len(re.findall(r"<" + _VENDOR + r"(?:arg|parameter|param)\b", segment, re.IGNORECASE))
-            closes = len(re.findall(r"</" + _VENDOR + r"(?:arg|parameter|param)\s*>", segment, re.IGNORECASE))
-            if opens > closes:
-                continue
+            if not heads_ready:  # only paid once a candidate close exists
+                heads_ready = True
+                elements = {e[0]: e[1] for e in _arg_elements(text[start:])}
+                for h in _ARG_HEAD_RE.finditer(text, start):
+                    rel = h.start() - start
+                    heads.append(h.start())
+                    ends.append(start + elements[rel] if rel in elements else len(text) + 1)
+            while hi < len(heads) and heads[hi] < match.start():
+                max_end = max(max_end, ends[hi])
+                hi += 1
+            if max_end > match.start():
+                continue  # inside an argument value
         return match.start(), match.end()
     return -1, -1
 
@@ -687,7 +832,7 @@ def _coerce_scalar(value: str, ptype: Any) -> Any:
         parsed, _ = loads_tolerant(stripped)
         if isinstance(parsed, (list, dict)):
             return parsed
-    if "null" in types and stripped.lower() in ("null", "none", ""):
+    if "null" in types and (stripped.lower() in ("null", "none") or (stripped == "" and "string" not in types)):
         return None
     if not types or types == ["any"]:
         parsed, _ = loads_tolerant(stripped)
@@ -717,7 +862,8 @@ def coerce_args(args: Dict[str, Any], schema: Optional[Dict[str, Any]]) -> Dict[
             out[key] = _coerce_scalar(val, ptype)
         elif isinstance(val, (int, float)) and not isinstance(val, bool):
             types = ptype if isinstance(ptype, list) else [ptype]
-            if "string" in [str(t).lower() for t in types]:
+            lowered = [str(t).lower() for t in types]
+            if "string" in lowered and not {"number", "integer"} & set(lowered):
                 out[key] = str(val)
     return out
 
@@ -736,6 +882,8 @@ def validate_args(args: Dict[str, Any], schema: Optional[Dict[str, Any]]) -> Lis
             return [path + " exceeds schema validation depth"]
         if spec is False:
             return [path + " is not allowed"]
+        if isinstance(value, float) and not math.isfinite(value):
+            return [path + " must be a finite number"]
         if not isinstance(spec, dict):
             return []
         errors: List[str] = []
@@ -767,7 +915,7 @@ def validate_args(args: Dict[str, Any], schema: Optional[Dict[str, Any]]) -> Lis
             "array": isinstance(value, list),
             "object": isinstance(value, dict),
         }
-        if types and not any(predicates.get(t, True) for t in types):
+        if types and not any(predicates.get(t, True) if isinstance(t, str) else True for t in types):
             return errors + [path + " must be " + "|".join(map(str, types))]
         def same(a: Any, b: Any) -> bool:
             if isinstance(a, bool) != isinstance(b, bool):
@@ -918,7 +1066,7 @@ def _rename_target(key: str, props: Dict[str, Any], taken: Iterable[str]) -> Opt
         if low in lowered:
             return lowered[low]
         flat = re.sub(r"[^a-z0-9]", "", low)
-        if flat in plain:
+        if flat and flat in plain:
             return plain[flat]
     close = difflib.get_close_matches(key.lower(), list(lowered), n=1, cutoff=0.82)
     if close:
@@ -967,7 +1115,7 @@ def repair_args(
         strays.remove(key)
         changed = True
 
-    required = [name for name in (schema.get("required") or []) if isinstance(name, str)]
+    required = [name for name in _required_list(schema) if isinstance(name, str)]
     missing = [name for name in required if name not in out]
     if len(missing) == 1 and len(strays) == 1:
         out[missing[0]] = out.pop(strays[0])
@@ -975,7 +1123,7 @@ def repair_args(
         changed = True
 
     extra = schema.get("additionalProperties")
-    if strays and extra is not True:
+    if strays and extra is not True and not isinstance(extra, dict):
         for key in strays:
             out.pop(key, None)
         changed = True
@@ -986,7 +1134,7 @@ def render_tool_example(tool: ToolDef) -> str:
     """One correct call for `tool`, to show a model what it got wrong."""
     schema = tool.schema if isinstance(tool.schema, dict) else {}
     props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
-    required = [n for n in (schema.get("required") or []) if isinstance(n, str) and n in props]
+    required = [n for n in _required_list(schema) if isinstance(n, str) and n in props]
     names = required or list(props)[:2]
     example: Dict[str, Any] = {}
     for name in names:
@@ -1079,7 +1227,7 @@ def args_only_tool(
     for tool in tools_by_name.values():
         schema = tool.schema if isinstance(tool.schema, dict) else {}
         props = schema.get("properties")
-        required = {n for n in (schema.get("required") or []) if isinstance(n, str)}
+        required = {n for n in _required_list(schema) if isinstance(n, str)}
         if not isinstance(props, dict) or not props or not required:
             continue
         if keys <= set(props) and required <= keys:
@@ -1126,24 +1274,53 @@ _ENVELOPE_ONLY_KEYS = frozenset(
 )
 
 
-def _bare_call_envelope(text: str, tools_by_name: Dict[str, ToolDef]) -> Optional[ToolCall]:
-    """Parse `text` as a bare call envelope, registered tool or not."""
+# Names a coding model plausibly means as a call even when the client did not
+# register that tool (so the call reaches the rejection/retry path, not the user).
+_COMMON_TOOL_NAMES = frozenset({
+    "read", "write", "edit", "multiedit", "bash", "shell", "grep", "glob", "ls",
+    "todowrite", "webfetch", "websearch", "task", "str_replace_editor", "create_file",
+    "run_command", "execute", "execute_command", "read_file", "write_file", "apply_patch",
+})
+
+
+def _plausible_tool_name(name: str, tools_by_name: Dict[str, ToolDef]) -> bool:
+    low = name.lower()
+    if low in {k.lower() for k in tools_by_name} or low in _COMMON_TOOL_NAMES:
+        return True
+    return bool(difflib.get_close_matches(low, [k.lower() for k in tools_by_name], n=1, cutoff=0.6))
+
+
+def _bare_call_envelope(
+    text: str, tools_by_name: Dict[str, ToolDef], whole: bool = True,
+    allow_implied: Optional[bool] = None,
+) -> Optional[ToolCall]:
+    """Parse `text` as a bare call envelope, registered tool or not.
+
+    `whole` says the object is the entire reply. A nameless argument object, or an
+    envelope naming something that is not remotely a tool, only counts then: in the
+    middle of prose it is far more likely an example (`{"name": "Widget", ...}`) or
+    quoted data than a call.
+    """
     parsed, _repaired = loads_tolerant(text)
     if not isinstance(parsed, dict):
         return None
     inner_fn = parsed.get("function") if isinstance(parsed.get("function"), dict) else {}
     name = ""
     for key in _BARE_CALL_KEYS:
-        value = inner_fn.get("name") if key == "function" else parsed.get(key)
+        value = (inner_fn.get("name") if inner_fn else parsed.get(key)) if key == "function" else parsed.get(key)
         if isinstance(value, str) and value:
             name = value
             break
     if not name:
+        if not (whole if allow_implied is None else allow_implied):
+            return None
         implied = args_only_tool(parsed, tools_by_name)
         if implied:
             return _build_call(implied, parsed, text, True, tools_by_name)
         return None
     if set(parsed) - _ENVELOPE_ONLY_KEYS:
+        return None
+    if not whole and not _plausible_tool_name(name, tools_by_name):
         return None
     args = None
     for source in (parsed, inner_fn):
@@ -1177,20 +1354,50 @@ def bare_call_starts(
             yield start
 
 
+def _open_depth(text: str) -> int:
+    depth = 0
+    for _i, ch, in_str in _walk_strings(text):
+        if not in_str and ch in "[{":
+            depth += 1
+        elif not in_str and ch in "]}" and depth:
+            depth -= 1
+    return depth
+
+
 def find_bare_call(
     text: str,
     tools_by_name: Dict[str, ToolDef],
     at_line_start: bool = True,
     extra: Optional[Tuple[str, ...]] = None,
+    context: str = "",
 ) -> Optional[Tuple[int, int, ToolCall]]:
-    """Find the first line-leading bare JSON call. Returns (start, end, call)."""
+    """Find the first line-leading bare JSON call. Returns (start, end, call).
+
+    `context` is text already shown before `text` (streaming), so a fence or
+    prose that preceded this chunk still counts.
+    """
     if extra is None:
         extra = argument_key_prefixes(tools_by_name)
+    off = len(context)
+    full = context + text
+    spans = literal_spans(full)
     for start in bare_call_starts(text, at_line_start, extra):
         end = json_object_end(text, start)
         if end < 0:
-            continue
-        call = _bare_call_envelope(text[start:end], tools_by_name)
+            # Everything after an unclosed object is inside it; scanning on would
+            # be quadratic on '{"name"\n' * 4000.
+            return None
+        if _in_spans(spans, off + start):
+            continue  # inside a code block the model is showing
+        if _open_depth(text[:start]) > 0:
+            continue  # nested inside an enclosing array/object: data, not a call
+        fenced = _FENCE_OPEN_TAIL_RE.search(full[:off + start]) is not None
+        trailing = not re.sub(r"\A\s*`{3}[ \t]*", "", text[end:]).strip()
+        whole = trailing and not full[:_fence_backoff(full, off + start)].strip()
+        # A nameless argument object only counts when it ends the reply unfenced
+        # ("Let me inspect it.\n{...}"); a fenced or mid-text one is shown data.
+        call = _bare_call_envelope(text[start:end], tools_by_name, whole=whole,
+                                   allow_implied=whole or (trailing and not fenced))
         if call is not None:
             return start, end, call
     return None
@@ -1232,26 +1439,33 @@ def parse_call_body(
 ) -> Optional[ToolCall]:
     """Turn the inside of a <tool_call> block into a ToolCall."""
     raw = body
-    body = strip_fences(body)
     name = attrs.get("name") or attrs.get("tool") or attrs.get("function") or ""
+    ds = _DS_HEAD_RE.match(body) if not name else None
+    if ds:
+        name = ds.group(1)
+        body = body[ds.end():]
+    body = strip_fences(body)
 
     # Raw <arg name="...">...</arg> form.
-    arg_matches = [] if body.lstrip().startswith(("{", "[")) else list(_ARG_RE.finditer(body))
+    arg_matches = [] if body.lstrip().startswith(("{", "[")) else _arg_elements(body)
     if arg_matches:
         args: Dict[str, Any] = {}
         for m in arg_matches:
-            a_attrs = _parse_attrs(m.group(2))
+            a_attrs = _parse_attrs(m[3])
             key = a_attrs.get("name") or a_attrs.get("key")
             if not key:
                 continue
-            val = m.group(3)
+            val = m[4]
             if val.startswith("\n"):
                 val = val[1:]
             if val.endswith("\n"):
                 val = val[:-1]
             args[key] = val
         if not name:
-            leading = body[: arg_matches[0].start()].strip()
+            leading = body[: arg_matches[0][0]].strip()
+            hermes = re.fullmatch(r"<name>\s*([\w.\-:]{1,64})\s*</name>", leading, re.IGNORECASE)
+            if hermes:
+                leading = hermes.group(1)
             parsed, _ = loads_tolerant(leading)
             if isinstance(parsed, dict):
                 name = safe_str(parsed.get("name"))
@@ -1283,8 +1497,12 @@ def parse_call_body(
                 repaired = repaired or rep2
             else:
                 pargs = {"value": pargs}
+        if pargs is None and name:
+            # The tag already names the tool: the body is the argument object itself.
+            pargs = parsed
+            pname = ""
         if pargs is None:
-            if name or pname:
+            if pname:
                 leftovers = {
                     k: v
                     for k, v in parsed.items()
@@ -1312,14 +1530,148 @@ def parse_call_body(
     return None
 
 
-def strip_hallucinated_results(text: str) -> str:
-    """Delete any <tool_result> the model wrote itself - it is always fabricated."""
-    cleaned = _RESULT_BLOCK_RE.sub("", text)
-    cleaned = _ORPHAN_RESULT_RE.sub("", cleaned)
-    return cleaned
+def json_end_cover(text: str, pos: int, at: int) -> int:
+    """End of the furthest bare-call object starting before `at`, else `at`."""
+    best = at
+    for start in bare_call_starts(text[pos:at]):
+        end = json_object_end(text, pos + start)
+        if end > best:
+            best = end
+    return best
+
+
+
+# Code the model is *showing* is never a call: inline code spans and code fences in
+# a language other than the few a model uses to (wrongly) fence a real call. Without
+# this, a README quoted from a tool result - `<tool_call>{"name":"Bash",...}` - was
+# executed as a real call.
+_RESULT_CLOSE_RE = re.compile(r"</" + _VENDOR + r"tool_result\s*>", re.IGNORECASE)
+_CALLABLE_FENCE_LANGS = frozenset({"", "json", "jsonc", "json5", "xml", "tool_call", "tool_code"})
+_FENCE_LINE_RE = re.compile(r"[ \t]*(`{3,}|~{3,})[ \t]*([^\s`]*)")
+
+
+def literal_spans(text: str) -> List[Tuple[int, int]]:
+    """Sorted (start, end) spans of `text` that are code shown to the reader."""
+    spans: List[Tuple[int, int]] = []
+    fence: Optional[Tuple[str, int, bool]] = None  # (marker, start, literal)
+    pos = 0
+    n = len(text)
+    while pos <= n:
+        nl = text.find("\n", pos)
+        end = n if nl < 0 else nl
+        line = text[pos:end]
+        fm = _FENCE_LINE_RE.match(line)
+        if fm:
+            marker = fm.group(1)
+            if fence is None:
+                fence = (marker[0] * 3, pos, fm.group(2).lower() not in _CALLABLE_FENCE_LANGS)
+            elif marker.startswith(fence[0]) and not fm.group(2):
+                if fence[2]:
+                    spans.append((fence[1], end))
+                fence = None
+        elif fence is None and "`" in line:
+            i = 0
+            while True:
+                a = line.find("`", i)
+                if a < 0:
+                    break
+                k = a
+                while k < len(line) and line[k] == "`":
+                    k += 1
+                run = line[a:k]
+                b = line.find(run, k)
+                while b >= 0 and b + len(run) < len(line) and line[b + len(run)] == "`":
+                    b = line.find(run, b + len(run) + 1)
+                if b < 0:
+                    spans.append((pos + a, pos + len(line)))  # still open: rest of line
+                    break
+                spans.append((pos + a, pos + b + len(run)))
+                i = b + len(run)
+        if nl < 0:
+            break
+        pos = nl + 1
+    if fence is not None and fence[2]:
+        spans.append((fence[1], n))
+    spans.sort()
+    return spans
+
+
+def _in_spans(spans: List[Tuple[int, int]], idx: int) -> bool:
+    lo, hi = 0, len(spans)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if spans[mid][0] <= idx:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo > 0 and spans[lo - 1][0] <= idx < spans[lo - 1][1]
+
+
+def _result_is_fabricated(text: str, idx: int, spans: List[Tuple[int, int]]) -> bool:
+    """A model-written <tool_result> starts a line (or directly follows a tag).
+
+    One mentioned mid-sentence - "results come back as <tool_result> blocks" - is
+    prose, and treating it as fabricated used to delete the rest of the answer.
+    """
+    if _in_spans(spans, idx):
+        return False
+    line_start = text.rfind("\n", 0, idx) + 1
+    before = text[line_start:idx].strip()
+    if not before or before.endswith(">"):
+        return True
+    # Mid-sentence it is fabricated only if it really is a block with a body.
+    return _RESULT_CLOSE_RE.search(text, idx) is not None
+
+
+def _next_live_open(text: str, pos: int, spans: List[Tuple[int, int]], prefix: str = "") -> Optional[Any]:
+    """`spans` are for `prefix + text`; `prefix` is the already-shown line start."""
+    off = len(prefix)
+    while True:
+        m = _OPEN_RE.search(text, pos)
+        if not m or not _in_spans(spans, off + m.start()):
+            return m
+        pos = m.start() + 1
+
+
+def _next_live_result(text: str, pos: int, spans: List[Tuple[int, int]], prefix: str = "") -> Optional[Any]:
+    off = len(prefix)
+    full = prefix + text if prefix else text
+    while True:
+        m = _RESULT_OPEN_RE.search(text, pos)
+        if not m or _result_is_fabricated(full, off + m.start(), spans):
+            return m
+        pos = m.start() + 1
+
+
+
+def strip_hallucinated_results(text: str, prefix: str = "") -> str:
+    """Delete any <tool_result> the model wrote itself - it is always fabricated.
+
+    A block is removed up to its closing tag; an unclosed one takes the rest of the
+    text with it. Linear (the old regexes were quadratic on repeated open tags), and
+    results mentioned in prose or code are left alone.
+    """
+    if not text or "tool_result" not in text.lower():
+        return text
+    spans = literal_spans(prefix + text)
+    out: List[str] = []
+    pos = 0
+    while True:
+        m = _next_live_result(text, pos, spans, prefix)
+        if not m:
+            out.append(text[pos:])
+            break
+        out.append(text[pos:m.start()])
+        close = _RESULT_CLOSE_RE.search(text, m.end())
+        if not close:
+            break
+        pos = close.end()
+    return "".join(out)
 
 
 def _clean_trailing_fence(text: str) -> str:
+    if len(re.findall(r"(?m)^[ \t]*`{3}", text)) % 2 == 0:
+        return text  # every fence is closed: the last one belongs to the prose
     return re.sub(r"(?:^|\n)`{3}[a-zA-Z0-9_+-]*[ \t]*\n?\s*$", "\n", text)
 
 
@@ -1327,13 +1679,20 @@ def extract_tool_calls(
     text: str,
     tools_by_name: Dict[str, ToolDef],
     salvage: bool = True,
+    context: str = "",
 ) -> Tuple[str, List[ToolCall]]:
-    """Split model output into (visible text, tool calls)."""
+    """Split model output into (visible text, tool calls).
+
+    `context` is text already shown before `text` (a streaming tail), so a bare
+    object is not mistaken for the whole reply.
+    """
     if not text:
         return "", []
+    sole = not context.strip()
     # A bare call must be recognized before scanning its JSON string values.
     candidate = strip_fences(text)
-    if salvage and candidate.startswith("{") and len(candidate) < 20000:
+    if (salvage and sole and candidate.startswith("{") and len(candidate) < 20000
+            and json_object_end(candidate, 0) == len(candidate)):
         call = _bare_call_envelope(candidate, tools_by_name)
         if call:
             return "", [call]
@@ -1341,17 +1700,29 @@ def extract_tool_calls(
     calls: List[ToolCall] = []
     out_parts: List[str] = []
     pos = 0
+    ctx_line = context[context.rfind("\n") + 1:]
+    spans = literal_spans(ctx_line + text)
 
     while True:
-        m = _OPEN_RE.search(text, pos)
-        result = re.search(r"<" + _VENDOR + r"tool_result\b[^>]*>", text[pos:], re.IGNORECASE)
-        if result and (not m or pos + result.start() < m.start()):
+        m = _next_live_open(text, pos, spans, ctx_line)
+        result = _next_live_result(text, pos, spans, ctx_line)
+        if result and (not m or result.start() < m.start()):
             # Everything after a fabricated result depends on a tool that never ran.
-            out_parts.append(text[pos:pos + result.start()])
+            out_parts.append(text[pos:result.start()])
+            pos = len(text)
             break
         if not m:
             out_parts.append(text[pos:])
             break
+        if salvage:
+            # A tag inside a bare call's JSON string is argument data, not syntax.
+            found = find_bare_call(text[pos:json_end_cover(text, pos, m.start())], tools_by_name,
+                                   context=context + text[:pos])
+            if found:
+                out_parts.append(text[pos:pos + found[0]])
+                calls.append(found[2])
+                pos += found[1]
+                continue
         tag = m.group(1)
         attrs = _parse_attrs(m.group(2))
         # Self-closing tag with everything in attributes.
@@ -1370,6 +1741,9 @@ def extract_tool_calls(
             call = parse_call_body(text[m.end() :], attrs, tools_by_name)
             if call:
                 calls.append(call)
+            else:
+                # Not a call after all ("models write <tool_call> tags"): keep the prose.
+                out_parts.append(text[m.start():])
             pos = len(text)
             break
 
@@ -1380,14 +1754,15 @@ def extract_tool_calls(
         pos = c_end
 
     visible = strip_vendor_markup("".join(out_parts))
-    visible = strip_hallucinated_results(visible)
+    visible = strip_hallucinated_results(visible, ctx_line)
     if calls:
         visible = _clean_trailing_fence(visible)
 
     # Salvage: a bare JSON call object with no tags at all.
-    if not calls and salvage:
+    if not calls and salvage and sole:
         candidate = strip_fences(visible)
-        if candidate.startswith("{") and len(candidate) < 20000:
+        if (candidate.startswith("{") and len(candidate) < 20000
+                and json_object_end(candidate, 0) == len(candidate)):
             call = _bare_call_envelope(candidate, tools_by_name)
             if call:
                 calls.append(call)
@@ -1398,13 +1773,16 @@ def extract_tool_calls(
         kept: List[str] = []
         rest = visible
         while True:
-            found = find_bare_call(rest, tools_by_name)
+            found = find_bare_call(rest, tools_by_name, context=context + "".join(kept))
             if not found:
                 break
             start, end, call = found
+            fenced = _FENCE_OPEN_TAIL_RE.search(rest[:start]) is not None
             kept.append(rest[:start])
             calls.append(call)
             rest = rest[end:]
+            if fenced:
+                rest = re.sub(r"\A[ \t]*\n?[ \t]*`{3}[ \t]*(?=\n|\Z)", "", rest)
         if calls:
             visible = _clean_trailing_fence("".join(kept)) + rest
 
@@ -1443,6 +1821,63 @@ class StreamToolParser:
         # the middle of a sentence or nested inside another object.
         self.at_line_start = True
         self.arg_prefixes = argument_key_prefixes(tools_by_name)
+        self.call_open_raw = ""
+        # Set after a fenced bare call: its closing fence belongs to the call.
+        self.drop_fence_close = False
+
+    def _strip_results(self, text: str) -> str:
+        """strip_hallucinated_results, judged in the context of the open line."""
+        line = self.text_emitted[self.text_emitted.rfind("\n") + 1:]
+        return strip_hallucinated_results(text, line[-4000:])
+
+    def _drop_fence_close(self) -> bool:
+        """Eat the fence that closes a fenced bare call. True = wait for more text."""
+        stripped = self.buf.lstrip(" \t\r\n")
+        if stripped.startswith("```"):
+            nl = stripped.find("\n")
+            if nl < 0 and stripped.strip("`").strip():
+                self.drop_fence_close = False
+                return False
+            if nl < 0:
+                return True
+            self.buf = stripped[nl:]
+            self.drop_fence_close = False
+            return False
+        if not stripped or "```".startswith(stripped):
+            return True
+        self.drop_fence_close = False
+        return False
+
+    def _live_tags(self) -> Tuple[Any, Any, Any]:
+        """(open tag, fabricated result, undecided result) in `buf`, code excluded.
+
+        Emitted text is part of the context: an inline code span or code fence that
+        opened in an earlier chunk still makes a tag in this one literal.
+        """
+        m = _OPEN_RE.search(self.buf)
+        raw_result = _RESULT_OPEN_RE.search(self.buf)
+        if not m and not raw_result:
+            return None, None, None
+        ctx = self.text_emitted[-20000:]
+        full = ctx + self.buf
+        off = len(ctx)
+        spans = literal_spans(full)
+        while m and _in_spans(spans, off + m.start()):
+            m = _OPEN_RE.search(self.buf, m.start() + 1)
+        result = pending = None
+        r = raw_result
+        while r:
+            idx = off + r.start()
+            if not _in_spans(spans, idx):
+                line_start = full.rfind("\n", 0, idx) + 1
+                before = full[line_start:idx].strip()
+                if not before or before.endswith(">") or _RESULT_CLOSE_RE.search(self.buf, r.end()):
+                    result = r
+                else:
+                    pending = r  # mid-sentence: fabricated only if a close tag follows
+                break
+            r = _RESULT_OPEN_RE.search(self.buf, r.start() + 1)
+        return m, result, pending
 
     @staticmethod
     def _holdback_len(buf: str) -> int:
@@ -1512,6 +1947,7 @@ class StreamToolParser:
         """
         if len(buf) > 200000:
             return 0
+        full = len(buf)
         stop = len(buf)
         for pattern in (_OPEN_RE, _RESULT_OPEN_RE):
             hit = pattern.search(buf)
@@ -1520,7 +1956,7 @@ class StreamToolParser:
         buf = buf[:stop]
         for start in bare_call_starts(buf, self.at_line_start, self.arg_prefixes):
             if json_object_end(buf, start) < 0:
-                return len(buf) - _fence_backoff(buf, start)
+                return full - _fence_backoff(buf, start)
         return 0
 
     def feed(self, delta: str) -> List[str]:
@@ -1536,6 +1972,8 @@ class StreamToolParser:
             if len(self.buf) > 1 and not _maybe_bare_sentinel(self.buf):
                 self.buf = self.buf[1:]
                 self.sentinel_tail = False
+        if self.drop_fence_close and self._drop_fence_close():
+            return []
         # Do not leak a bare JSON call as text before salvaging it at EOF.
         if (self.salvage and not self.text_emitted and not self.calls and not self.in_call
                 and strip_fences(self.buf).lstrip().startswith("{") and len(self.buf) < 20000):
@@ -1558,29 +1996,51 @@ class StreamToolParser:
                 self.at_line_start = True
                 continue
 
-            m = _OPEN_RE.search(self.buf)
-            result = re.search(r"<" + _VENDOR + r"tool_result\b[^>]*>", self.buf, re.IGNORECASE)
+            m, result, pending = self._live_tags()
+            if pending and (not m or pending.start() < m.start()) and not result:
+                # Hold everything from an undecided mid-sentence <tool_result> on;
+                # finish() or a later close tag decides.
+                head = self.buf[:pending.start()]
+                if head:
+                    self._emit(out, self._strip_results(strip_vendor_markup(head)))
+                self.buf = self.buf[pending.start():]
+                break
 
             # A wrapped call, or a hallucinated result, always wins over a bare JSON
             # object: the object may simply be this call's own argument block.
             limit = len(self.buf)
+            if m and self.salvage:
+                # A tag inside an open bare call's JSON string is data, not syntax.
+                for s0 in bare_call_starts(self.buf[:m.start()], self.at_line_start,
+                                           self.arg_prefixes):
+                    e0 = json_object_end(self.buf, s0)
+                    if e0 < 0 or e0 > m.start():
+                        m = None
+                        if result and result.start() < max(e0, len(self.buf)):
+                            result = None
+                        break
             if m:
                 limit = min(limit, m.start())
             if result:
                 limit = min(limit, result.start())
             if self.salvage and limit and limit < 200000:
                 found = find_bare_call(self.buf[:limit], self.tools_by_name,
-                                       self.at_line_start, self.arg_prefixes)
+                                       self.at_line_start, self.arg_prefixes,
+                                       context=self.text_emitted[-4000:])
                 if found:
                     start, end, call = found
                     head = strip_vendor_markup(self.buf[:start])
+                    if _FENCE_OPEN_TAIL_RE.search(self.buf[:start]):
+                        self.drop_fence_close = True
                     if not self.saw_any_call and not self.calls:
                         head = _clean_trailing_fence(head)
-                    self._emit(out, strip_hallucinated_results(head))
+                    self._emit(out, self._strip_results(head))
                     self.calls.append(call)
                     self.saw_any_call = True
                     self.buf = self.buf[end:]
                     self.at_line_start = True
+                    if self.drop_fence_close and self._drop_fence_close():
+                        break
                     continue
             if result and (not m or result.start() < m.start()):
                 self._emit(out, strip_vendor_markup(self.buf[:result.start()]))
@@ -1591,7 +2051,7 @@ class StreamToolParser:
                 head = strip_vendor_markup(self.buf[: m.start()])
                 if self.saw_any_call is False and not self.calls:
                     head = _clean_trailing_fence(head)
-                self._emit(out, strip_hallucinated_results(head))
+                self._emit(out, self._strip_results(head))
                 self.at_line_start = True
                 self.call_tag = m.group(1)
                 self.call_attrs = _parse_attrs(m.group(2))
@@ -1603,6 +2063,7 @@ class StreamToolParser:
                     self.buf = self.buf[m.end() :]
                     continue
                 self.in_call = True
+                self.call_open_raw = m.group(0)
                 self.buf = self.buf[m.end() :]
                 continue
 
@@ -1622,7 +2083,7 @@ class StreamToolParser:
             emit = self.buf[: len(self.buf) - hold] if hold else self.buf
             self.buf = self.buf[len(self.buf) - hold :] if hold else ""
             if emit:
-                self._emit(out, strip_hallucinated_results(strip_vendor_markup(emit)))
+                self._emit(out, self._strip_results(strip_vendor_markup(emit)))
             break
 
         return out
@@ -1636,11 +2097,23 @@ class StreamToolParser:
             if call:
                 self.calls.append(call)
                 self.saw_any_call = True
+            else:
+                # Never closed and not a call: it was prose mentioning the tag.
+                self._emit(out, self._strip_results(self.call_open_raw + body))
             self.buf = ""
             self.in_call = False
         elif self.buf:
+            if self.drop_fence_close and self.buf.strip(" \t\r\n`") == "":
+                self.buf = ""
+            line_ctx = self.text_emitted[self.text_emitted.rfind("\n") + 1:]
+            if line_ctx.strip() and _RESULT_OPEN_RE.match(self.buf):
+                # An undecided mid-sentence result: judge it with its line.
+                cleaned = self._strip_results(line_ctx + self.buf)
+                self.buf = cleaned[len(line_ctx):] if cleaned.startswith(line_ctx) else ""
+        if self.buf and not self.in_call:
             if self.salvage:
-                visible, salvaged = extract_tool_calls(self.buf, self.tools_by_name, salvage=True)
+                visible, salvaged = extract_tool_calls(self.buf, self.tools_by_name, salvage=True,
+                                                       context=self.text_emitted[-4000:])
                 if salvaged:
                     self.calls.extend(salvaged)
                     self.saw_any_call = True
@@ -1649,7 +2122,7 @@ class StreamToolParser:
                     return out, self.calls
             if self.sentinel_tail and self.buf.strip("\uff5c| \t\r\n") == "":
                 self.buf = ""
-            tail = strip_hallucinated_results(strip_vendor_markup(self.buf))
+            tail = self._strip_results(strip_vendor_markup(self.buf))
             if self.calls:
                 tail = _clean_trailing_fence(tail)
             if tail.strip():
