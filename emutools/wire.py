@@ -150,14 +150,24 @@ def _upstream_url(cfg: Config) -> str:
 
 
 def _do_request(cfg: Config, payload: Dict[str, Any], stream: bool):
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    body = utf8(json.dumps(payload, ensure_ascii=False))
     req = urllib.request.Request(_upstream_url(cfg), data=body, method="POST")
     req.add_header("content-type", "application/json")
     req.add_header("accept", "text/event-stream" if stream else "application/json")
     req.add_header("user-agent", "emutools/%s" % __version__)
     if cfg.upstream_key:
         req.add_header("authorization", "Bearer " + cfg.upstream_key)
-    return urllib.request.urlopen(req, timeout=cfg.timeout)
+    return _OPENER.open(req, timeout=cfg.timeout)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow upstream redirects: a 30x would re-POST the bearer key elsewhere."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect())
 
 
 def _request_with_retries(cfg: Config, payload: Dict[str, Any], stream: bool):
@@ -182,6 +192,12 @@ def _request_with_retries(cfg: Config, payload: Dict[str, Any], stream: bool):
                 time.sleep(delay)
                 last = UpstreamError("upstream %s" % exc.code, exc.code, text)
                 continue
+            if 300 <= exc.code < 400:
+                raise UpstreamError(
+                    "upstream redirected (HTTP %s) to %s; redirects are not followed, point the "
+                    "upstream base URL at the final address" % (exc.code, exc.headers.get("location", "?")),
+                    502,
+                )
             raise UpstreamError(
                 "upstream returned HTTP %s" % exc.code, exc.code, truncate_middle(text, 2000)
             )
@@ -204,7 +220,9 @@ def upstream_complete(cfg: Config, payload: Dict[str, Any]) -> Dict[str, Any]:
     payload["stream"] = False
     resp = _request_with_retries(cfg, payload, stream=False)
     try:
-        raw = resp.read()
+        raw = resp.read(_MAX_UPSTREAM_BYTES + 1)
+        if len(raw) > _MAX_UPSTREAM_BYTES:
+            raise UpstreamError("upstream response exceeds %d bytes" % _MAX_UPSTREAM_BYTES, 502)
     except (OSError, http.client.HTTPException) as exc:
         raise UpstreamError("upstream response interrupted: %s" % exc, 502) from exc
     finally:
@@ -227,6 +245,10 @@ def upstream_complete(cfg: Config, payload: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
+_MAX_UPSTREAM_BYTES = 64 * 1024 * 1024
+_NEWLINE_RE = re.compile(r"\r\n|\r(?=.)|\n", re.DOTALL)
+
+
 def iter_sse(resp) -> Iterator[Dict[str, Any]]:
     """Decode UTF-8 incrementally and dispatch complete SSE events, not lines.
 
@@ -236,7 +258,9 @@ def iter_sse(resp) -> Iterator[Dict[str, Any]]:
     decoder = codecs.getincrementaldecoder("utf-8-sig")("strict")
     read = getattr(resp, "read1", None) or resp.read
     buf = ""
+    scan = 0  # buf[:scan] is known to hold no line break
     fields: List[str] = []
+    event_size = 0
     eof = False
     while not eof:
         raw = read(4096)
@@ -245,11 +269,17 @@ def iter_sse(resp) -> Iterator[Dict[str, Any]]:
             buf += decoder.decode(raw, final=eof)
         except UnicodeError as exc:
             raise UpstreamError("upstream SSE is not valid UTF-8", 502) from exc
+        if len(buf) > _MAX_UPSTREAM_BYTES or event_size > _MAX_UPSTREAM_BYTES:
+            raise UpstreamError("upstream SSE event exceeds %d bytes" % _MAX_UPSTREAM_BYTES, 502)
         while True:
             # Hold a trailing CR until the next read: it may be half of CRLF.
-            newline = re.search(r"\r\n|\r(?=.)|\n", buf, re.DOTALL)
+            newline = _NEWLINE_RE.search(buf, scan)
             if newline:
                 line, buf = buf[:newline.start()], buf[newline.end():]
+                scan = 0
+            elif not eof:
+                scan = max(0, len(buf) - 1)
+                break
             elif eof and buf:
                 line, buf = buf.rstrip("\r"), ""
             elif eof and fields:
@@ -261,6 +291,7 @@ def iter_sse(resp) -> Iterator[Dict[str, Any]]:
                     continue
                 data = "\n".join(fields)
                 fields = []
+                event_size = 0
                 if data.strip() == "[DONE]":
                     return
                 if not data.strip():
@@ -276,6 +307,7 @@ def iter_sse(resp) -> Iterator[Dict[str, Any]]:
                 name, _, value = line.partition(":")
                 if name == "data":
                     fields.append(value[1:] if value.startswith(" ") else value)
+                    event_size += len(fields[-1])
 
 
 def upstream_stream(cfg: Config, payload: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
@@ -285,6 +317,39 @@ def upstream_stream(cfg: Config, payload: Dict[str, Any]) -> Iterator[Dict[str, 
     payload["stream_options"] = {"include_usage": True}
     resp = _request_with_retries(cfg, payload, stream=True)
     saw_finish = False
+    last_usage: Optional[Dict[str, Any]] = None
+    native: Dict[int, Dict[str, str]] = {}
+
+    def _flush_native() -> Iterator[Dict[str, Any]]:
+        # Native streamed tool_calls are folded into the emulated text form.
+        for i in sorted(native):
+            nc = native[i]
+            parsed, _ = loads_tolerant(nc["args"] or "{}")
+            yield {"text": "\n" + CALL_OPEN + "\n" + json.dumps(
+                {"name": nc["name"], "arguments": parsed if isinstance(parsed, dict) else {}},
+                ensure_ascii=False,
+            ) + "\n" + CALL_CLOSE}
+        native.clear()
+
+    held = {"text": "", "reasoning": ""}
+
+    def _piece(kind: str, chunk: str) -> Iterator[Dict[str, Any]]:
+        # Re-pair UTF-16 surrogates split across chunks (JSON "\\ud83d" + "\\ude00").
+        chunk = held[kind] + chunk
+        held[kind] = ""
+        if chunk and "\ud800" <= chunk[-1] <= "\udbff":
+            held[kind], chunk = chunk[-1], chunk[:-1]
+        if chunk:
+            chunk = chunk.encode("utf-16", "surrogatepass").decode("utf-16", "replace") if any(
+                "\ud800" <= c <= "\udfff" for c in chunk) else chunk
+            yield {kind: chunk}
+
+    def _release() -> Iterator[Dict[str, Any]]:
+        for kind in ("reasoning", "text"):
+            if held[kind]:
+                held[kind] = ""
+                yield {kind: "\ufffd"}
+
     try:
         for obj in iter_sse(resp):
             if not isinstance(obj, dict):
@@ -295,7 +360,8 @@ def upstream_stream(cfg: Config, payload: Dict[str, Any]) -> Iterator[Dict[str, 
                 raise UpstreamError("upstream stream error: %s" % msg, 502)
             usage = obj.get("usage")
             if isinstance(usage, dict):
-                yield {"usage": usage}
+                # Some upstreams send running totals on every chunk; keep the last.
+                last_usage = usage
             choices = obj.get("choices")
             if not isinstance(choices, list) or not choices:
                 continue
@@ -306,21 +372,41 @@ def upstream_stream(cfg: Config, payload: Dict[str, Any]) -> Iterator[Dict[str, 
             if isinstance(delta, dict):
                 rc = delta.get("reasoning_content") or delta.get("reasoning")
                 if isinstance(rc, str) and rc:
-                    yield {"reasoning": rc}
+                    yield from _piece("reasoning", rc)
                 content = delta.get("content")
                 if isinstance(content, str) and content:
-                    yield {"text": content}
+                    yield from _piece("text", content)
                 elif isinstance(content, list):
                     for part in content:
                         if isinstance(part, dict) and isinstance(part.get("text"), str):
-                            yield {"text": part["text"]}
+                            yield from _piece("text", part["text"])
+                for tcd in delta.get("tool_calls") or []:
+                    if not isinstance(tcd, dict):
+                        continue
+                    try:
+                        idx = int(tcd.get("index") or 0)
+                    except (TypeError, ValueError):
+                        idx = 0
+                    slot = native.setdefault(idx, {"name": "", "args": ""})
+                    fn = tcd.get("function") if isinstance(tcd.get("function"), dict) else {}
+                    slot["name"] += safe_str(fn.get("name"))
+                    a = fn.get("arguments")
+                    slot["args"] += a if isinstance(a, str) else (canon_json(a) if a is not None else "")
             msgobj = ch.get("message")
             if isinstance(msgobj, dict) and isinstance(msgobj.get("content"), str):
-                yield {"text": msgobj["content"]}
+                yield from _piece("text", msgobj["content"])
             fr = ch.get("finish_reason")
             if fr:
+                yield from _release()
+                for ev in _flush_native():
+                    yield ev
                 saw_finish = True
                 yield {"finish": fr}
+        yield from _release()
+        for ev in _flush_native():
+            yield ev
+        if last_usage is not None:
+            yield {"usage": last_usage}
         if not saw_finish:
             raise UpstreamError("upstream stream ended before finish_reason", 502)
     except (OSError, http.client.HTTPException) as exc:
@@ -343,7 +429,7 @@ def extract_completion_text(data: Dict[str, Any]) -> Tuple[str, str, Dict[str, A
     content = msg.get("content")
     if isinstance(content, list):
         content = "".join(
-            p.get("text", "") for p in content if isinstance(p, dict)
+            p["text"] for p in content if isinstance(p, dict) and isinstance(p.get("text"), str)
         )
     if not isinstance(content, str):
         content = ""
@@ -487,7 +573,7 @@ def anthropic_to_canon(body: Dict[str, Any], cfg: Config) -> CanonRequest:
         elif ttype == "tool":
             choice = safe_str(tc.get("name")) or "required"
     elif isinstance(tc, str):
-        choice = tc
+        choice = {"any": "required", "required": "required", "none": "none"}.get(tc, "auto")
 
     stops = body.get("stop_sequences")
     if not isinstance(stops, list):
@@ -544,7 +630,13 @@ def openai_to_canon(body: Dict[str, Any], cfg: Config) -> CanonRequest:
             continue
 
         calls: List[ToolCall] = []
-        for nc in raw.get("tool_calls") or []:
+        native_calls = list(raw.get("tool_calls") or [])
+        if isinstance(raw.get("function_call"), dict):
+            # Legacy OpenAI function calling; id = name so role:"function" results pair up.
+            native_calls.append(
+                {"id": safe_str(raw["function_call"].get("name")), "function": raw["function_call"]}
+            )
+        for nc in native_calls:
             if not isinstance(nc, dict):
                 continue
             fn = nc.get("function") if isinstance(nc.get("function"), dict) else {}
@@ -589,6 +681,9 @@ def openai_to_canon(body: Dict[str, Any], cfg: Config) -> CanonRequest:
 
     choice = "auto"
     tc = body.get("tool_choice")
+    if tc is None and "function_call" in body:
+        fc = body["function_call"]
+        tc = {"type": "function", "function": fc} if isinstance(fc, dict) else fc
     if isinstance(tc, str):
         choice = tc if tc in ("auto", "none", "required") else "auto"
     elif isinstance(tc, dict):
@@ -733,9 +828,11 @@ def build_upstream_payload(
         except (TypeError, ValueError):
             pass
 
-    stops: List[str] = list(req.stop)
+    stops: List[str] = []
     if allow_tools and req.tools and req.tool_choice != "none" and cfg.use_stop and not cfg.parallel:
+        # Ours goes first so the [:4] cap below can never drop it.
         stops.append(CALL_CLOSE)
+    stops.extend(req.stop)
     # Upstreams cap stop sequences; keep it small and unique.
     deduped: List[str] = []
     for s in stops:

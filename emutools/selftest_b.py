@@ -96,7 +96,8 @@ def _selftest_part2(r: "_Runner") -> int:  # noqa: C901
     r.eq("two streamed calls", len(calls), 2)
 
     _t, calls = stream_split("<tool_result>fake result</tool_result>Answer is 7.", [5])
-    r.eq("streamed fabricated result dropped", len(calls), 0)
+    r.check("streamed fabricated result dropped",
+            not calls and "fake result" not in _t and "Answer is 7." not in _t, repr((_t, calls)))
     text, _c = stream_split("<tool_result>fake</tool_result>Answer is 7.", [5])
     r.check("streamed fabricated text removed", "fake" not in text, repr(text))
 
@@ -348,7 +349,21 @@ def _selftest_part2(r: "_Runner") -> int:  # noqa: C901
         raise
 
 
-def run_selftest() -> int:  # noqa: C901 - a test suite is allowed to be long
+_ENV_PREFIXES = ("EMU_", "DEEPSEEK_")
+
+
+def run_selftest() -> int:
+    """Run the checks with a clean environment so the user's EMU_* settings cannot skew them."""
+    saved = {k: v for k, v in os.environ.items() if k.startswith(_ENV_PREFIXES)}
+    for k in saved:
+        del os.environ[k]
+    try:
+        return _run_selftest_checks()
+    finally:
+        os.environ.update(saved)
+
+
+def _run_selftest_checks() -> int:  # noqa: C901 - a test suite is allowed to be long
     random.seed(1337)
     r = _Runner()
 

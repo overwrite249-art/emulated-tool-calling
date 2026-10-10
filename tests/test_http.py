@@ -13,6 +13,23 @@ from emutools.server import Handler, Server
 from emutools.wire import iter_sse, upstream_stream, UpstreamError
 
 
+_SAVED_ENV = {}
+
+
+def setUpModule():
+    """Run against defaults: a developer's EMU_* settings must not change results."""
+    import os
+    for key in [k for k in os.environ if k.startswith(("EMU_", "DEEPSEEK_"))]:
+        _SAVED_ENV[key] = os.environ.pop(key)
+
+
+def tearDownModule():
+    import os
+    os.environ.update(_SAVED_ENV)
+    _SAVED_ENV.clear()
+
+
+
 BODY = {"model": "test-model", "messages": [{"role": "user", "content": "hi"}]}
 
 
@@ -100,10 +117,10 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(body["error"]["type"], "invalid_request_error")
 
     def test_invalid_utf8_rejected_instead_of_replaced(self):
-        self.assertEqual(self.post(b'{"messages":[],"x":"\xff"}')[0], 400)
+        self.assertEqual(self.post(b'{"messages":[{"role":"user","content":"hi"}],"x":"\xff"}')[0], 400)
 
     def test_nan_is_not_valid_json(self):
-        self.assertEqual(self.post(b'{"messages":[],"temperature":NaN}')[0], 400)
+        self.assertEqual(self.post(b'{"messages":[{"role":"user","content":"hi"}],"metadata":{"x":NaN}}')[0], 400)
 
     def test_conflicting_length_and_chunked_is_rejected(self):
         raw = b"POST /messages HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n{}"

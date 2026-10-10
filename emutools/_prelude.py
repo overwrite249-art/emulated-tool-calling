@@ -20,10 +20,11 @@ import threading
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 __version__ = "1.0.0"
 
@@ -53,6 +54,7 @@ __all__ = [
     "ThreadingHTTPServer",
     "Any",
     "Dict",
+    "Iterable",
     "Iterator",
     "List",
     "Optional",

@@ -16,6 +16,23 @@ from emutools.protocol import (
 from emutools.wire import iter_sse, build_upstream_payload, openai_to_canon, anthropic_to_canon
 
 
+_SAVED_ENV = {}
+
+
+def setUpModule():
+    """Run against defaults: a developer's EMU_* settings must not change results."""
+    import os
+    for key in [k for k in os.environ if k.startswith(("EMU_", "DEEPSEEK_"))]:
+        _SAVED_ENV[key] = os.environ.pop(key)
+
+
+def tearDownModule():
+    import os
+    os.environ.update(_SAVED_ENV)
+    _SAVED_ENV.clear()
+
+
+
 TOOLS = [
     ToolDef("Read", schema={"type": "object", "required": ["file_path"],
                            "properties": {"file_path": {"type": "string"}}}),

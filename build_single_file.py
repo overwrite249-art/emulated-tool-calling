@@ -6,7 +6,8 @@
     python3 build_single_file.py out.py      # writes ./out.py
     python3 build_single_file.py --check     # exit 1 if ./emutools.py is stale
 
-Nobody has to run this by hand. The built file is committed at the repository
+On the default branch nobody has to run this by hand (PRs and other branches
+must commit the rebuilt file; CI fails them when it is stale). The built file is committed at the repository
 root, so `curl`-and-run works straight from a clone, and CI rebuilds it on every
 push to the default branch and commits it back when it differs (`--check` is what
 makes a stale file a red build). The package exists so the code is reviewable
@@ -15,6 +16,7 @@ module by module; the single file is what you deploy.
 The output is verified to parse before it is written, and `emutools.py --selftest`
 is the real check that it worked.
 """
+import argparse
 import ast
 import os
 import sys
@@ -76,10 +78,12 @@ def render():
 
 
 def main(argv=None):
-    argv = list(sys.argv[1:] if argv is None else argv)
-    check = "--check" in argv
-    argv = [a for a in argv if a != "--check"]
-    dest = argv[0] if argv else os.path.join(HERE, "emutools.py")
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("dest", nargs="?", default=os.path.join(HERE, "emutools.py"),
+                    help="output path (default: ./emutools.py)")
+    ap.add_argument("--check", action="store_true", help="exit 1 if dest is stale")
+    args = ap.parse_args(argv)
+    dest, check = args.dest, args.check
     text = render()
 
     if check:
@@ -96,8 +100,8 @@ def main(argv=None):
 
     with open(dest, "w", encoding="utf-8") as fh:
         fh.write(text)
-    print("wrote %s (%d bytes, %d lines)" % (dest, len(text), text.count("\n")))
-    print("verify with: python3 %s --selftest" % os.path.basename(dest))
+    print("wrote %s (%d bytes, %d lines)" % (dest, len(text.encode("utf-8")), text.count("\n")))
+    print("verify with: python3 %s --selftest" % dest)
     return 0
 
 

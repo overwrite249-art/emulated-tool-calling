@@ -29,10 +29,10 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Built-in 200-check suite
         run: python -m emutools --selftest
-      # On a push the single-file job below rebuilds and commits this, so only
-      # pull requests need to fail on a stale file.
+      # Pushes to the default branch get the file rebuilt and committed by the
+      # single-file job below; everywhere else (PRs, other branches) a stale file fails.
       - name: Committed single file is current
-        if: github.event_name != 'push'
+        if: github.event_name != 'push' || github.ref != format('refs/heads/{0}', github.event.repository.default_branch)
         run: python build_single_file.py --check
       - name: Committed single file passes the whole suite on its own
         run: python emutools.py --selftest
@@ -50,7 +50,11 @@ jobs:
   # package and forgets the built file gets it rebuilt and committed here, so
   # emutools.py at the repository root is always the current single-file build.
   single-file:
+    needs: offline
     if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    concurrency:
+      group: single-file-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -58,7 +62,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref_name }}
+          ref: ${{ github.sha }}
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -78,7 +83,13 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add emutools.py
           git commit -m 'build: refresh single-file emutools.py'
-          git push
+          git fetch origin "$GITHUB_REF_NAME"
+          if ! git rebase "origin/$GITHUB_REF_NAME"; then
+            echo "branch moved underneath us; the newer run will rebuild"
+            git rebase --abort || true
+            exit 0
+          fi
+          git push origin "HEAD:$GITHUB_REF_NAME"
 
   real-cli:
     permissions:

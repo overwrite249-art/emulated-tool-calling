@@ -14,8 +14,9 @@ class CLIMockUpstream(_MockUpstream):
         super().__init__()
         self.fixture = fixture
 
-    def _next(self):
-        messages = self.last_request().get("messages", [])
+    def _next(self, body=None):
+        # Answer the request being handled, not whichever arrived last.
+        messages = (body or self.last_request()).get("messages", [])
         system = "\n".join(m.get("content", "") for m in messages if m.get("role") == "system")
         tools = re.findall(r"^### ([\w.-]+)$", system, re.MULTILINE)
         if not tools:

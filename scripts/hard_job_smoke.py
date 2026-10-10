@@ -212,6 +212,35 @@ def free_port():
         return sock.getsockname()[1]
 
 
+
+def bash_outputs(records, needle):
+    """Outputs of shell tool calls whose command mentions `needle`.
+
+    A marker string merely appearing in the transcript proves nothing: it is in the
+    prompt and in the fixture source the client may Read. Only count it when it came
+    back from actually running the test.
+    """
+    out = []
+    ids = set()
+    for r in records:
+        msg = r.get("message") if isinstance(r.get("message"), dict) else {}
+        for b in msg.get("content") or []:
+            if (isinstance(b, dict) and b.get("type") == "tool_use"
+                    and str(b.get("name", "")).lower() == "bash"
+                    and needle in json.dumps(b.get("input"), ensure_ascii=False)):
+                ids.add(b.get("id"))
+    for r in records:
+        msg = r.get("message") if isinstance(r.get("message"), dict) else {}
+        for b in msg.get("content") or []:
+            if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id") in ids:
+                out.append(json.dumps(b.get("content"), ensure_ascii=False))
+        part = r.get("part") if isinstance(r.get("part"), dict) else {}
+        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+        if str(part.get("tool", "")).lower() == "bash" and needle in json.dumps(state.get("input"), ensure_ascii=False):
+            out.append(json.dumps(state.get("output"), ensure_ascii=False))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--cli", required=True, help="path to the claude binary")
@@ -341,7 +370,8 @@ def main():
                     records.append(json.loads(line))
                 except ValueError:
                     pass
-            result["client_ran_real_test"] = "HARD_TESTS_PASS" in transcript
+            result["client_ran_real_test"] = any(
+                "HARD_TESTS_PASS" in o for o in bash_outputs(records, "test_hard.py"))
             result["client_reported_success"] = any(
                 r.get("type") == "result" and not r.get("is_error")
                 and "HARD_JOB_OK" in (r.get("result") or "") for r in records)
